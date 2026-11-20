@@ -1,0 +1,4 @@
+[build]
+# x86-64-v3 = AVX2/BMI2/FMA: runs on the Cascade Lake scorers and on any
+# recent desktop CPU (so the image can be tested locally).
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq"]
