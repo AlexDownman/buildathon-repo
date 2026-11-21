@@ -43,12 +43,22 @@ pub fn key_fast(b: &[u8], end: *const u8) -> u128 {
     let n = b.len();
     if n <= 15 && n > 0 && b.as_ptr().wrapping_add(16) <= end {
         let v = u128::from_be_bytes(unsafe { std::ptr::read_unaligned(b.as_ptr() as *const [u8; 16]) });
-        let mask = !0u128 << (8 * (16 - n));
-        (v & mask) | n as u128
+        (v & KEYMASK[n]) | n as u128
     } else {
         key_of(b)
     }
 }
+
+/// KEYMASK[n] keeps the top n bytes of a big-endian u128
+static KEYMASK: [u128; 16] = {
+    let mut t = [0u128; 16];
+    let mut n = 1;
+    while n < 16 {
+        t[n] = !0u128 << (8 * (16 - n));
+        n += 1;
+    }
+    t
+};
 
 #[cold]
 fn long_key(b: &[u8]) -> u128 {
@@ -96,16 +106,14 @@ pub fn cmp_key(a: u128, b: u128) -> Ordering {
     }
 }
 
+/// Cheap 128 -> 64 bit hash: good top bits (bucket choice) and, after the
+/// final fold, good low bits (table slots).
 #[inline(always)]
 pub fn hash128(k: u128) -> u64 {
     let lo = k as u64;
     let hi = (k >> 64) as u64;
-    let m = ((lo ^ 0x243F_6A88_85A3_08D3) as u128).wrapping_mul((hi ^ 0x1319_8A2E_0370_7344) as u128);
-    let mut x = (m as u64) ^ ((m >> 64) as u64) ^ lo.rotate_left(17);
-    x ^= x >> 32;
-    x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x ^= x >> 29;
-    x
+    let m = lo.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ hi.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    m ^ (m >> 29) ^ (m >> 47)
 }
 
 // ---------------------------------------------------------------------------
@@ -778,18 +786,23 @@ pub fn parse_ts_fast(f: &[u8], end: *const u8) -> Option<i64> {
         if !ok {
             return None;
         }
-        // xor, not subtract: separator bytes would borrow into their neighbours
-        let d0 = w0 ^ (0x30 * ONES);
-        let d1 = w1 ^ (0x30 * ONES);
-        let d2 = w2 ^ (0x30 * ONES);
+        // digit values with separators zeroed, then byte k := 10*d[k] + d[k+1]
+        // (no carries: every byte is <= 9 before, <= 99 after)
+        let p0 = (w0 ^ (0x30 * ONES)) & M0D;
+        let p1 = (w1 ^ (0x30 * ONES)) & M1D;
+        let p2 = (w2 ^ (0x30 * ONES)) & M2D;
+        let t0 = p0.wrapping_mul(10).wrapping_add(p0 >> 8);
+        let t1 = p1.wrapping_mul(10).wrapping_add(p1 >> 8);
+        let t2 = p2.wrapping_mul(10).wrapping_add(p2 >> 8);
         let b = |w: u64, i: u32| ((w >> (8 * i)) & 0xFF) as i64;
-        let y = b(d0, 0) * 1000 + b(d0, 1) * 100 + b(d0, 2) * 10 + b(d0, 3);
-        let mo = b(d0, 5) * 10 + b(d0, 6);
-        let d = b(d1, 0) * 10 + b(d1, 1);
-        let h = b(d1, 3) * 10 + b(d1, 4);
-        let mi = b(d1, 6) * 10 + b(d1, 7);
-        let s = b(d2, 6) * 10 + b(d2, 7);
-        if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || s > 59 {
+        let y = b(t0, 0) * 100 + b(t0, 2);
+        let mo = b(t0, 5);
+        let d = b(t1, 0);
+        let h = b(t1, 3);
+        let mi = b(t1, 6);
+        let s = b(t2, 6);
+        let ok = ((mo as u64).wrapping_sub(1) < 12) & ((d as u64).wrapping_sub(1) < 31) & (h < 24) & (mi < 60) & (s < 60);
+        if !ok {
             return None;
         }
         let days = if (TY0..TY0 + TNY as i64).contains(&y) {

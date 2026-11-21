@@ -921,16 +921,12 @@ fn ev_bucket(h: u64) -> usize {
     (h >> (64 - EV_BITS.load(AO::Relaxed))) as usize
 }
 
+/// same hash as the link map, so an unlinked user's hash is reused as-is
 #[inline(always)]
 fn p_hash(k: u128) -> u64 {
-    hash128(k ^ 0x5bd1_e995_5bd1_e995)
+    hash128(k)
 }
 
-/// person bucket = top bits of p_hash; the per-bucket grouping table uses its low bits
-#[inline(always)]
-fn p_bucket(k: u128) -> usize {
-    (p_hash(k) >> (64 - P_BITS.load(AO::Relaxed))) as usize
-}
 
 const RING: usize = 16;
 
@@ -952,8 +948,11 @@ fn parse_events(d: &[u8], s: usize, e: usize, ctx: &Ctx, wid: usize, outk: &mut 
     let mut ring = [PendEv::default(); RING];
     let mut cnt = 0usize;
     let finish = |p: &PendEv, outk: &mut Parts<DKey, 8>, outp: &mut Parts<EvOut, 8>| {
-        let pkey = ctx.link.get_h(p.ukey, p.hu).unwrap_or(p.ukey);
-        let pb = p_bucket(pkey);
+        let (pkey, ph) = match ctx.link.get_h(p.ukey, p.hu) {
+            Some(n) => (n, p_hash(n)),
+            None => (p.ukey, p.hu),
+        };
+        let pb = (ph >> (64 - P_BITS.load(AO::Relaxed))) as usize;
         let i = outp.push_idx(pb, EvOut { pkey, ts: p.ts, price: p.price, cat: p.cat, kind: p.kind });
         let loc = mkloc(wid, pb, i);
         outk.push(p.b as usize, DKey { k0: p.ekey as u64, k1: (p.ekey >> 64) as u64, ingest: p.ingest, loc });
@@ -1030,8 +1029,11 @@ fn parse_clicks(d: &[u8], s: usize, e: usize, ctx: &Ctx, out: &mut Parts<ClRec, 
     let mut ring = [PendCl::default(); RING];
     let mut cnt = 0usize;
     let finish = |p: &PendCl, out: &mut Parts<ClRec, 4>| {
-        let pkey = ctx.link.get_h(p.ukey, p.hu).unwrap_or(p.ukey);
-        out.push(p_bucket(pkey), ClRec { pkey, ckey: p.ckey, ts: p.ts, camp: p.camp });
+        let (pkey, ph) = match ctx.link.get_h(p.ukey, p.hu) {
+            Some(n) => (n, p_hash(n)),
+            None => (p.ukey, p.hu),
+        };
+        out.push((ph >> (64 - P_BITS.load(AO::Relaxed))) as usize, ClRec { pkey, ckey: p.ckey, ts: p.ts, camp: p.camp });
     };
     for_rows::<4>(d, s, e, |f| {
         let [cid, uid, camp, ts] = *f;
@@ -1164,6 +1166,7 @@ struct Scratch {
     skeys: Vec<u64>,
     skeys2: Vec<u64>,
     tmp: Vec<EvOut>,
+    pos: Vec<u32>,
 }
 
 /// LSD radix sort of u64 keys by their top 31 bits (3 passes of 11 bits).
@@ -1216,6 +1219,7 @@ impl Scratch {
             skeys: vec![],
             skeys2: vec![],
             tmp: vec![],
+            pos: vec![],
         }
     }
 }
@@ -1230,13 +1234,11 @@ fn process_bucket(
     rows: &mut Vec<URow>,
     camp: &mut [[i64; 4]],
 ) {
-    let evs = || evsrc.iter().flat_map(|s| s.iter()).filter(|e| e.kind != K_INVALID);
-    let cls = || clsrc.iter().flat_map(|s| s.iter());
     let n: usize = evsrc.iter().map(|s| s.len()).sum(); // upper bound (includes dead rows)
     if n == 0 {
         return;
     }
-    // distinct persons <= n; start small and grow
+    // ---- events: person ids via a local hash table, counted as we go ----
     let mut cap = ((n / 8).max(64)).next_power_of_two();
     'retry: loop {
         let mask = cap - 1;
@@ -1244,73 +1246,91 @@ fn process_bucket(
         sc.table.resize(cap, (0, 0));
         sc.pkeys.clear();
         sc.pid.clear();
-        for e in evs() {
-            let k = e.pkey;
-            let mut i = (p_hash(k) as usize) & mask;
-            let id = loop {
-                let s = unsafe { sc.table.get_unchecked_mut(i) };
-                if s.0 == k {
-                    break s.1;
+        sc.eoff.clear();
+        sc.eoff.push(0);
+        for sl in evsrc {
+            for e in sl.iter() {
+                if e.kind == K_INVALID {
+                    continue;
                 }
-                if s.0 == 0 {
-                    if (sc.pkeys.len() + 1) * 2 > cap {
-                        cap *= 4;
-                        continue 'retry;
+                let k = e.pkey;
+                let mut i = (p_hash(k) as usize) & mask;
+                let id = loop {
+                    let s = unsafe { sc.table.get_unchecked_mut(i) };
+                    if s.0 == k {
+                        break s.1;
                     }
-                    let id = sc.pkeys.len() as u32;
-                    *s = (k, id);
-                    sc.pkeys.push(k);
-                    break id;
-                }
-                i = (i + 1) & mask;
-            };
-            sc.pid.push(id);
+                    if s.0 == 0 {
+                        if (sc.pkeys.len() + 1) * 2 > cap {
+                            cap *= 4;
+                            continue 'retry;
+                        }
+                        let id = sc.pkeys.len() as u32;
+                        *s = (k, id);
+                        sc.pkeys.push(k);
+                        sc.eoff.push(0);
+                        break id;
+                    }
+                    i = (i + 1) & mask;
+                };
+                unsafe { *sc.eoff.get_unchecked_mut(id as usize + 1) += 1 };
+                sc.pid.push(id);
+            }
         }
         break;
     }
     let np = sc.pkeys.len();
     let mask = cap - 1;
-    // counting sort of events by person
-    sc.eoff.clear();
-    sc.eoff.resize(np + 1, 0);
-    for &id in &sc.pid {
-        sc.eoff[id as usize + 1] += 1;
-    }
     for i in 0..np {
         sc.eoff[i + 1] += sc.eoff[i];
     }
+    let nv = sc.eoff[np] as usize;
+    // counting-sort scatter (every slot in 0..nv is written exactly once)
     sc.evs.clear();
-    sc.evs.resize(n, EvOut::default());
+    sc.evs.reserve(nv);
+    sc.pos.clear();
+    sc.pos.extend_from_slice(&sc.eoff[..np]);
     {
-        let mut pos: Vec<u32> = sc.eoff[..np].to_vec();
-        for (e, &id) in evs().zip(sc.pid.iter()) {
-            let p = &mut pos[id as usize];
-            sc.evs[*p as usize] = *e;
-            *p += 1;
+        let dst = sc.evs.as_mut_ptr();
+        let mut j = 0usize;
+        for sl in evsrc {
+            for e in sl.iter() {
+                if e.kind == K_INVALID {
+                    continue;
+                }
+                unsafe {
+                    let id = *sc.pid.get_unchecked(j) as usize;
+                    let p = sc.pos.get_unchecked_mut(id);
+                    dst.add(*p as usize).write(*e);
+                    *p += 1;
+                }
+                j += 1;
+            }
         }
+        unsafe { sc.evs.set_len(nv) };
     }
-    // clicks of persons that have events
+    // ---- clicks of persons that have events ----
     sc.pid.clear();
-    for c in cls() {
-        let k = c.pkey;
-        let mut i = (p_hash(k) as usize) & mask;
-        let id = loop {
-            let s = unsafe { sc.table.get_unchecked(i) };
-            if s.0 == k {
-                break s.1;
-            }
-            if s.0 == 0 {
-                break u32::MAX;
-            }
-            i = (i + 1) & mask;
-        };
-        sc.pid.push(id);
-    }
     sc.coff.clear();
     sc.coff.resize(np + 1, 0);
-    for &id in &sc.pid {
-        if id != u32::MAX {
-            sc.coff[id as usize + 1] += 1;
+    for sl in clsrc {
+        for c in sl.iter() {
+            let k = c.pkey;
+            let mut i = (p_hash(k) as usize) & mask;
+            let id = loop {
+                let s = unsafe { sc.table.get_unchecked(i) };
+                if s.0 == k {
+                    break s.1;
+                }
+                if s.0 == 0 {
+                    break u32::MAX;
+                }
+                i = (i + 1) & mask;
+            };
+            if id != u32::MAX {
+                unsafe { *sc.coff.get_unchecked_mut(id as usize + 1) += 1 };
+            }
+            sc.pid.push(id);
         }
     }
     for i in 0..np {
@@ -1318,16 +1338,26 @@ fn process_bucket(
     }
     let nc = sc.coff[np] as usize;
     sc.cls.clear();
-    sc.cls.resize(nc, ClRec::default());
+    sc.cls.reserve(nc);
+    sc.pos.clear();
+    sc.pos.extend_from_slice(&sc.coff[..np]);
     {
-        let mut pos: Vec<u32> = sc.coff[..np].to_vec();
-        for (c, &id) in cls().zip(sc.pid.iter()) {
-            if id != u32::MAX {
-                let p = &mut pos[id as usize];
-                sc.cls[*p as usize] = *c;
-                *p += 1;
+        let dst = sc.cls.as_mut_ptr();
+        let mut j = 0usize;
+        for sl in clsrc {
+            for c in sl.iter() {
+                let id = unsafe { *sc.pid.get_unchecked(j) };
+                j += 1;
+                if id != u32::MAX {
+                    unsafe {
+                        let p = sc.pos.get_unchecked_mut(id as usize);
+                        dst.add(*p as usize).write(*c);
+                        *p += 1;
+                    }
+                }
             }
         }
+        unsafe { sc.cls.set_len(nc) };
     }
     let evs_s = std::mem::take(&mut sc.evs);
     let mut evs_s = evs_s;
@@ -1388,6 +1418,7 @@ fn process_person(p: u128, evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scr
     let mut cur_day = u32::MAX;
     let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
     let (mut cj, mut crun) = (0usize, 0usize);
+    let has_clicks = !cls.is_empty();
 
     macro_rules! flush {
         () => {
@@ -1455,8 +1486,10 @@ fn process_person(p: u128, evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scr
         slot[0] += 1;
         slot[1] += purch as i64;
         slot[2] += rev;
-        sc.starts.push(start);
-        sc.days.push(day);
+        if has_clicks {
+            sc.starts.push(start);
+            sc.days.push(day);
+        }
     }
     flush!();
 
