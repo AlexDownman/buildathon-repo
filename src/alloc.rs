@@ -6,6 +6,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 
 pub struct BigAlloc;
 
+pub static HUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 const BIG: usize = 64 << 10;
 const PAGE: usize = 4096;
 
@@ -27,7 +29,9 @@ unsafe fn map(size: usize) -> *mut u8 {
         if p == libc::MAP_FAILED {
             return std::ptr::null_mut();
         }
-        libc::madvise(p, size, libc::MADV_HUGEPAGE);
+        if HUGE.load(std::sync::atomic::Ordering::Relaxed) {
+            libc::madvise(p, size, libc::MADV_HUGEPAGE);
+        }
         p as *mut u8
     }
 }

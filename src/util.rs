@@ -165,10 +165,14 @@ impl<V: Copy + Default> KeyMap<V> {
 
     /// Returns (value, inserted_now).
     pub fn get_or_insert(&mut self, k: u128, v: V) -> (V, bool) {
+        self.get_or_insert_h(k, hash128(k), v)
+    }
+
+    pub fn get_or_insert_h(&mut self, k: u128, h: u64, v: V) -> (V, bool) {
         if (self.len + 1) * 2 > self.slots.len() {
             self.grow();
         }
-        let mut i = (hash128(k) as usize) & self.mask;
+        let mut i = (h as usize) & self.mask;
         loop {
             let s = &mut self.slots[i];
             if s.0 == k {
@@ -198,6 +202,10 @@ impl<V: Copy + Default> KeyMap<V> {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn slots_mut(&mut self) -> &mut [(u128, V)] {
+        &mut self.slots
     }
 }
 
@@ -461,6 +469,89 @@ mod tests {
     }
 
     #[test]
+    fn rows_match_split() {
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let alpha = b"ab,,\"\" \r";
+        for round in 0..3000 {
+            let mut data = b"h1,h2,h3\n".to_vec();
+            let mut lines = Vec::new();
+            for _ in 0..50 {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                let n = if round % 7 == 0 { (x % 200) as usize } else { (x % 24) as usize };
+                let mut l = Vec::new();
+                let mut y = x;
+                for _ in 0..n {
+                    y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    l.push(alpha[((y >> 33) % alpha.len() as u64) as usize]);
+                }
+                data.extend_from_slice(&l);
+                data.push(b'\n');
+                lines.push(l);
+            }
+            let len = data.len();
+            data.extend_from_slice(&[0u8; 256]);
+            let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+            for_rows::<3>(&data, 0, len, |f| got.push(f.iter().map(|v| v.to_vec()).collect()));
+            let mut want: Vec<Vec<Vec<u8>>> = Vec::new();
+            for l in &lines {
+                let mut o: [&[u8]; 3] = [b""; 3];
+                if split(l, &mut o) {
+                    want.push(o.iter().map(|v| v.to_vec()).collect());
+                }
+            }
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn ts_fast_matches() {
+        let cases: Vec<&[u8]> = vec![
+            b"2026-10-03T23:58:10Z", b"2026-10-03T19:58:10-04:00", b"1791071890000", b"0001791071890000",
+            b"2026-10-03t23:58:10Z", b"2026-10-03T23:58:10z", b"2026-02-29T00:00:00Z", b"2028-02-29T00:00:00Z",
+            b"2026-10-03T23:58:10+0200", b"2026-10-03T23:58:10+24:00", b"2026-10-03T23:58:10+05:60",
+            b"2026-10-03T23:58:10-00:00", b"1791071890000.0", b"-5", b"000000000000000000000001", b"",
+            b"2026-13-03T23:58:10Z", b"2026-12-32T23:58:10Z", b"2026-12-31T24:00:00Z", b"2026-12-31T23:60:00Z",
+            b"2026-12-31T23:59:60Z", b"2026-12-31 23:59:59Z", b"2026-1a-31T23:59:59Z", b"2026/12/31T23:59:59Z",
+            b"2026-12-31T23:59:59.123Z", b"86400000", b"123456789", b"9999999999999999", b"17910718900\xd9\xa2",
+            b"2026-10-03T23:58:10+05:30", b"2026-10-03T23:58:1\xef\xbc\x95Z", b"0000-01-01T00:00:00Z", b"9999-12-31T23:59:59Z",
+            b"1791071890000\r", b"2026-10-03T23:58:10Z\r", b"2026-00-03T23:58:10Z", b"2026-10-00T23:58:10Z",
+        ];
+        for c in cases {
+            let mut buf = c.to_vec();
+            buf.extend_from_slice(&[b'9'; 32]);
+            let f = &buf[..c.len()];
+            let end = buf.as_ptr_range().end;
+            assert_eq!(parse_ts_fast(f, end), parse_ts(f), "{:?}", String::from_utf8_lossy(c));
+        }
+        // exhaustive-ish over random digit strings of every length
+        let mut x = 88172645463325252u64;
+        for _ in 0..200000 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let n = (x % 20) as usize;
+            let mut buf: Vec<u8> = (0..n).map(|i| b"0123456789x"[((x >> (i * 3)) % 11) as usize]).collect();
+            let m = buf.len();
+            buf.extend_from_slice(&[b'7'; 32]);
+            let end = buf.as_ptr_range().end;
+            assert_eq!(parse_ts_fast(&buf[..m], end), parse_ts(&buf[..m]));
+        }
+        // random single/double corruptions of valid F1/F2 strings
+        let bases: [&[u8]; 4] = [b"2028-02-29T23:59:59Z", b"2027-12-31T00:00:00-10:00", b"2025-01-01T12:30:45+12:00", b"2026-02-28T23:59:59Z"];
+        let alphabet = b"0123456789-:TZtz+ .,/\x00\xff";
+        for _ in 0..300000 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let mut v = bases[(x % 4) as usize].to_vec();
+            for k in 0..((x >> 2) % 3) {
+                let pos = ((x >> (8 + 8 * k)) as usize) % v.len();
+                v[pos] = alphabet[((x >> (30 + 5 * k)) as usize) % alphabet.len()];
+            }
+            let m = v.len();
+            v.extend_from_slice(&[b'5'; 32]);
+            let end = v.as_ptr_range().end;
+            assert_eq!(parse_ts_fast(&v[..m], end), parse_ts(&v[..m]), "{:?}", String::from_utf8_lossy(&v[..m]));
+        }
+    }
+
+    #[test]
     fn keys_order() {
         let a = key_of(b"a");
         let b = key_of(b"a\0");
@@ -534,6 +625,25 @@ fn below(x: usize) -> u128 {
     (1u128 << x) - 1
 }
 
+/// Quoting is valid iff every quote sits at its field's first or last byte,
+/// the count is even, and no separator lies between an opening and a closing
+/// quote (prefix-XOR of the quote mask is 0 at every comma). Together these
+/// mean each field has 0 quotes, or exactly 2 at both ends (length >= 2).
+#[inline(always)]
+fn quotes_ok(q: u128, c: u128, ll: usize) -> bool {
+    let starts = (c << 1) | 1;
+    let ends = (c >> 1) | (1u128 << (ll - 1));
+    let mut x = q;
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x ^= x << 64;
+    (q & !(starts | ends)) == 0 && q.count_ones() % 2 == 0 && (x & c) == 0
+}
+
 /// Calls f with the N fields of every well-formed line whose first byte lies
 /// in [s, e). The file's first line (the header) is skipped.
 #[inline(always)]
@@ -559,30 +669,35 @@ pub fn for_rows<'a, const N: usize>(data: &'a [u8], s: usize, e: usize, mut f: i
             if nl != 0 {
                 let ll = nl.trailing_zeros() as usize;
                 let lm = below(ll);
-                let mut c = cm & lm;
+                let c = cm & lm;
                 let q = qt & lm;
                 if c.count_ones() as usize == N - 1 && ll > 0 {
-                    let line = &data[pos..pos + ll];
-                    let mut a = 0usize;
-                    let mut ok = true;
-                    for (i, slot) in out.iter_mut().enumerate() {
-                        let b = if i + 1 < N {
-                            let t = c.trailing_zeros() as usize;
-                            c &= c.wrapping_sub(1);
-                            t
-                        } else {
-                            ll
-                        };
-                        let fq = q & below(b) & !below(a);
-                        let isq = (fq != 0) as usize;
-                        let want = (1u128 << a) | (1u128 << (b.wrapping_sub(1) & 127));
-                        ok &= (fq == 0) | ((b >= a + 2) & (fq == want));
-                        let lo = a + isq;
-                        let hi = (b - isq).max(lo);
-                        *slot = unsafe { line.get_unchecked(lo..hi) };
-                        a = b + 1;
-                    }
+                    let ok = q == 0 || quotes_ok(q, c, ll);
                     if ok {
+                        let line = &data[pos..pos + ll + 1];
+                        let mut lo = c as u64;
+                        let mut hi = (c >> 64) as u64;
+                        let mut a = 0usize;
+                        for (i, slot) in out.iter_mut().enumerate() {
+                            let b = if i + 1 < N {
+                                if lo != 0 {
+                                    let t = lo.trailing_zeros() as usize;
+                                    lo &= lo - 1;
+                                    t
+                                } else {
+                                    let t = 64 + hi.trailing_zeros() as usize;
+                                    hi &= hi.wrapping_sub(1);
+                                    t
+                                }
+                            } else {
+                                ll
+                            };
+                            // valid quoting is already established: a quoted field
+                            // starts and ends with a quote (and has length >= 2)
+                            let isq = (unsafe { *line.get_unchecked(a) } == b'"') as usize;
+                            *slot = unsafe { line.get_unchecked(a + isq..b - isq) };
+                            a = b + 1;
+                        }
                         f(&out);
                     }
                 }
@@ -599,4 +714,128 @@ pub fn for_rows<'a, const N: usize>(data: &'a [u8], s: usize, e: usize, mut f: i
         }
         pos = end + 1;
     }
+}
+
+// ---------------------------------------------------------------------------
+// SWAR timestamp parsing (same results as parse_ts)
+// ---------------------------------------------------------------------------
+
+const ONES: u64 = 0x0101_0101_0101_0101;
+
+#[inline(always)]
+fn ld8(p: *const u8) -> u64 {
+    u64::from_le_bytes(unsafe { std::ptr::read_unaligned(p as *const [u8; 8]) })
+}
+
+/// Bytes selected by `m` (0xFF per byte) are ASCII digits.
+#[inline(always)]
+fn digits_ok(w: u64, m: u64) -> bool {
+    let hi = w & 0xF0F0_F0F0_F0F0_F0F0;
+    let hi6 = (w.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0;
+    ((hi ^ (0x30 * ONES)) | (hi6 ^ (0x30 * ONES))) & m & 0xF0F0_F0F0_F0F0_F0F0 == 0
+}
+
+/// 8 ASCII digits, first char in the lowest byte -> value.
+#[inline(always)]
+fn parse8(w: u64) -> u64 {
+    let mut v = w.wrapping_sub(0x30 * ONES);
+    v = (v.wrapping_mul(10)).wrapping_add(v >> 8) & 0x00FF_00FF_00FF_00FF;
+    v = (v.wrapping_mul(100)).wrapping_add(v >> 16) & 0x0000_FFFF_0000_FFFF;
+    (v.wrapping_mul(10000)).wrapping_add(v >> 32) & 0xFFFF_FFFF
+}
+
+/// Like parse_ts, but may read up to 16 bytes from the field start when that
+/// stays below `end`.
+#[inline(always)]
+pub fn parse_ts_fast(f: &[u8], end: *const u8) -> Option<i64> {
+    let n = f.len();
+    let p = f.as_ptr();
+    if n == 20 || n == 25 {
+        // "YYYY-MM-" "DDTHH:MM" ":SS" + Z | +HH:MM
+        let w0 = ld8(p);
+        let w1 = ld8(unsafe { p.add(8) });
+        let w2 = ld8(unsafe { p.add(11) }); // "HH:MM:SS"
+        const SEP0: u64 = (b'-' as u64) << 32 | (b'-' as u64) << 56;
+        const M0D: u64 = 0x00FF_FF00_FFFF_FFFF;
+        const M0S: u64 = 0xFF00_00FF_0000_0000;
+        const SEP1: u64 = (b'T' as u64) << 16 | (b':' as u64) << 40;
+        const M1D: u64 = 0xFFFF_00FF_FF00_FFFF;
+        const M1S: u64 = 0x0000_FF00_00FF_0000;
+        const SEP2: u64 = (b':' as u64) << 16 | (b':' as u64) << 40;
+        const M2D: u64 = 0xFFFF_00FF_FF00_FFFF;
+        const M2S: u64 = 0x0000_FF00_00FF_0000;
+        let ok = digits_ok(w0, M0D)
+            & digits_ok(w1, M1D)
+            & digits_ok(w2, M2D)
+            & ((w0 & M0S) == SEP0)
+            & ((w1 & M1S) == SEP1)
+            & ((w2 & M2S) == SEP2);
+        if !ok {
+            return None;
+        }
+        // xor, not subtract: separator bytes would borrow into their neighbours
+        let d0 = w0 ^ (0x30 * ONES);
+        let d1 = w1 ^ (0x30 * ONES);
+        let d2 = w2 ^ (0x30 * ONES);
+        let b = |w: u64, i: u32| ((w >> (8 * i)) & 0xFF) as i64;
+        let y = b(d0, 0) * 1000 + b(d0, 1) * 100 + b(d0, 2) * 10 + b(d0, 3);
+        let mo = b(d0, 5) * 10 + b(d0, 6);
+        let d = b(d1, 0) * 10 + b(d1, 1);
+        let h = b(d1, 3) * 10 + b(d1, 4);
+        let mi = b(d1, 6) * 10 + b(d1, 7);
+        let s = b(d2, 6) * 10 + b(d2, 7);
+        if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || s > 59 {
+            return None;
+        }
+        let days = if (TY0..TY0 + TNY as i64).contains(&y) {
+            let i = ((y - TY0) * 12 + mo - 1) as usize;
+            let ms = MONTH_START[i] as i64;
+            if d > MONTH_START[i + 1] as i64 - ms {
+                return None;
+            }
+            ms + d - 1
+        } else {
+            return parse_ts(f);
+        };
+        let mut t = days * 86_400 + h * 3600 + mi * 60 + s;
+        if n == 20 {
+            if f[19] != b'Z' {
+                return None;
+            }
+        } else {
+            let sign = f[19];
+            let a = f[20].wrapping_sub(b'0');
+            let bb = f[21].wrapping_sub(b'0');
+            let c = f[23].wrapping_sub(b'0');
+            let e = f[24].wrapping_sub(b'0');
+            if (sign != b'+' && sign != b'-') || f[22] != b':' || a > 9 || bb > 9 || c > 9 || e > 9 {
+                return None;
+            }
+            let oh = a as i64 * 10 + bb as i64;
+            let om = c as i64 * 10 + e as i64;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = oh * 3600 + om * 60;
+            if sign == b'+' {
+                t -= off;
+            } else {
+                t += off;
+            }
+        }
+        return Some(t * 1000);
+    }
+    if (9..=16).contains(&n) && p.wrapping_add(16) <= end {
+        // F3: right-align n digits into 16 bytes, left-padded with '0'
+        let x = u128::from_le_bytes(unsafe { std::ptr::read_unaligned(p as *const [u8; 16]) });
+        let sh = 8 * (16 - n) as u32;
+        let x = (x << sh) | (u128::from_le_bytes([b'0'; 16]) & ((1u128 << sh) - 1));
+        let lo = x as u64;
+        let hi = (x >> 64) as u64;
+        if !(digits_ok(lo, !0) & digits_ok(hi, !0)) {
+            return None;
+        }
+        return Some((parse8(lo) * 100_000_000 + parse8(hi)) as i64);
+    }
+    parse_ts(f)
 }
