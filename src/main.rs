@@ -108,10 +108,14 @@ impl Ctx {
     }
 }
 
+/// (wall, user, sys) at each log point, for the probe summary
+static MARKS: Mutex<Vec<(f64, f64, f64)>> = Mutex::new(Vec::new());
+
 fn log(t0: Instant, msg: &str) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    MARKS.lock().unwrap().push((t0.elapsed().as_secs_f64(), tv(ru.ru_utime), tv(ru.ru_stime)));
     eprintln!(
         "[{:8.3}s] {}  (user {:.2}s sys {:.2}s minflt {})",
         t0.elapsed().as_secs_f64(),
@@ -242,6 +246,10 @@ fn read_small(p: &Path) -> Vec<u8> {
 
 fn main() {
     let t0 = Instant::now();
+    if let Some(dir) = std::env::var_os("PROBE_MICRO") {
+        probe_micro(Path::new(&dir));
+        return;
+    }
     if std::env::var_os("NOHUGE").is_some() {
         alloc::HUGE.store(false, AO::Relaxed);
     }
@@ -551,6 +559,7 @@ fn main() {
         }
     });
     log(t0, &format!("wrote {} user_daily rows, {} campaign_daily rows", nrows, ncrows));
+    probe_hooks(nthreads, &cd);
 }
 
 const L_BITS: u32 = 6;
@@ -619,6 +628,169 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
 }
 
 /// lists: per worker, (pairs, keys per shard)
+/// Diagnostics only (used by probe.sh, never by a real run):
+/// PROBE_OUT=file appends a one-line phase summary of this run to file;
+/// PROBE_NOTES=file adds its lines as extra campaign_daily rows.
+fn probe_hooks(nthreads: usize, cd: &Path) {
+    if let Some(path) = std::env::var_os("PROBE_OUT") {
+        let m = MARKS.lock().unwrap();
+        let mut line = format!("T{}", nthreads);
+        let names = ["", "L", "P", "D", "S", "W"];
+        for i in 1..m.len().min(names.len()) {
+            line += &format!(" {}{:.2}", names[i], m[i].0 - m[i - 1].0);
+        }
+        if let Some(l) = m.last() {
+            line += &format!(" ={:.2} u{:.1} s{:.1}", l.0, l.1, l.2);
+        }
+        let line = line.replace(" L0.", " L.").replace(" P0.", " P.").replace(" D0.", " D.").replace(" S0.", " S.").replace(" W0.", " W.").replace(" =0.", " =.");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+    if let Some(path) = std::env::var_os("PROBE_NOTES") {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let mut c = vec![
+            pq::Column::new("campaign_id", pq::Kind::Str, 0),
+            pq::Column::new("channel", pq::Kind::Str, 0),
+            pq::Column::new("day", pq::Kind::Date, 0),
+            pq::Column::new("sessions", pq::Kind::I64, 0),
+            pq::Column::new("purchasing_sessions", pq::Kind::I64, 0),
+            pq::Column::new("revenue_cents", pq::Kind::I64, 0),
+            pq::Column::new("assisted_sessions", pq::Kind::I64, 0),
+        ];
+        for (i, l) in lines.iter().enumerate() {
+            c[0].push_str(format!("{} {}", i, l).as_bytes());
+            c[1].push_str(b"probe");
+            c[2].push_i32(0);
+            for k in 3..7 {
+                c[k].push_i64(0);
+            }
+        }
+        let _ = pq::write(&cd.join("zz-probe.parquet"), lines.len(), &c);
+    }
+}
+
+/// Diagnostics only: micro-benchmarks of the machine primitives the pipeline
+/// leans on, appended as one line to PROBE_OUT.
+fn probe_micro(dir: &Path) {
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    let mut out = String::from("M");
+    let n = 512usize << 20;
+    let map = |huge: bool| unsafe {
+        let p = libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+        if huge {
+            libc::madvise(p, n, libc::MADV_HUGEPAGE);
+        }
+        p as *mut u8
+    };
+    let touch = |p: *mut u8| {
+        let mut i = 0;
+        while i < n {
+            unsafe { p.add(i).write_volatile(1) };
+            i += 4096;
+        }
+    };
+    // fresh anonymous memory: 4K pages, then huge pages, then rewriting faulted memory
+    let p = map(false);
+    let t = Instant::now();
+    touch(p);
+    out += &format!(" f4k={:.0}", ms(t));
+    let q = map(true);
+    let t = Instant::now();
+    touch(q);
+    out += &format!(" fthp={:.0}", ms(t));
+    let t = Instant::now();
+    unsafe { std::ptr::write_bytes(q, 7, n) };
+    out += &format!(" mset={:.0}", ms(t));
+    // fresh memory touched by 8 threads at once (fault scalability)
+    let r = map(true) as usize;
+    let t = Instant::now();
+    std::thread::scope(|sc| {
+        for k in 0..8 {
+            sc.spawn(move || {
+                let mut i = k * (n / 8);
+                while i < (k + 1) * (n / 8) {
+                    unsafe { (r as *mut u8).add(i).write_volatile(1) };
+                    i += 4096;
+                }
+            });
+        }
+    });
+    out += &format!(" fthp8={:.0}", ms(t));
+    unsafe {
+        libc::munmap(p as *mut libc::c_void, n);
+        libc::munmap(q as *mut libc::c_void, n);
+        libc::munmap(r as *mut libc::c_void, n);
+    }
+    // reading the events files: pread 1 thread, pread 8 threads, mmap+touch
+    let ev = Input::open(&dir.join("events"));
+    let chunks = ev.chunks();
+    let mut buf = vec![0u8; PIECE];
+    let t = Instant::now();
+    let mut sum = 0usize;
+    for &(fi, s, e) in &chunks {
+        let mut p = s;
+        while p < e {
+            let k = (e - p).min(PIECE);
+            ev.files[fi].0.read_exact_at(&mut buf[..k], p as u64).unwrap();
+            sum += buf[k - 1] as usize;
+            p += k;
+        }
+    }
+    out += &format!(" pr1={:.0}", ms(t));
+    let t = Instant::now();
+    par_for(8, chunks.len(), || vec![0u8; PIECE], |b, i| {
+        let (fi, s, e) = chunks[i];
+        let mut p = s;
+        while p < e {
+            let k = (e - p).min(PIECE);
+            ev.files[fi].0.read_exact_at(&mut b[..k], p as u64).unwrap();
+            p += k;
+        }
+    });
+    out += &format!(" pr8={:.0}", ms(t));
+    let t = Instant::now();
+    for (f, len) in &ev.files {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let m = libc::mmap(std::ptr::null_mut(), *len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) as *const u8;
+            let mut i = 0;
+            while i < *len {
+                sum += *m.add(i) as usize;
+                i += 4096;
+            }
+            libc::munmap(m as *mut libc::c_void, *len);
+        }
+    }
+    out += &format!(" mm1={:.0}", ms(t));
+    // thread spawn/join and raw syscall cost
+    let t = Instant::now();
+    for _ in 0..50 {
+        std::thread::scope(|sc| {
+            for _ in 0..8 {
+                sc.spawn(|| ());
+            }
+        });
+    }
+    out += &format!(" sp50={:.0}", ms(t));
+    let t = Instant::now();
+    for _ in 0..20000 {
+        unsafe { libc::getppid() };
+    }
+    out += &format!(" sc={:.0}ns", t.elapsed().as_nanos() as f64 / 20000.0);
+    out += &format!(" gb={:.2}", ev.bytes() as f64 / 1e9);
+    let _ = sum;
+    if let Some(path) = std::env::var_os("PROBE_OUT") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", out);
+        }
+    }
+    eprintln!("{}", out);
+}
+
 fn build_links(nthreads: usize, lists: &[LinkParse]) -> LinkMap {
     let ns = 1usize << L_BITS;
     // L1: dense ids per shard
