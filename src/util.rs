@@ -913,6 +913,11 @@ pub fn rows<'a, const N: usize, S: RowSink<'a>>(data: &'a [u8], s: usize, e: usi
     while pos < e {
         if pos + 128 <= len {
             let base = unsafe { data.as_ptr().add(pos) };
+            // mapped input: hardware prefetch stops at 4K pages, so run ahead
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(base.wrapping_add(2048) as *const i8, std::arch::x86_64::_MM_HINT_T0)
+            };
             let (n0, c0, q0) = unsafe { masks64(base) };
             if n0 != 0 {
                 // the line fits in the first 64 bytes
@@ -1006,7 +1011,7 @@ fn parse8(w: u64) -> u64 {
 /// 32-byte load; same results as parse_ts. Needs 32 readable bytes at f.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn iso_ts_avx2(f: &[u8]) -> Option<i64> {
+unsafe fn iso_ts_avx2<const MS: bool>(f: &[u8]) -> Option<i64> {
     use std::arch::x86_64::*;
     const fn bits(v: &[u32]) -> u32 {
         let mut m = 0;
@@ -1067,7 +1072,7 @@ unsafe fn iso_ts_avx2(f: &[u8]) -> Option<i64> {
         let off = _mm_extract_epi32(rh, 1) as i64;
         let dd = _mm256_extract_epi16(m, 3) as i64;
         if !(TY0..TY0 + TNY as i64).contains(&y) {
-            return parse_ts(f);
+            return if MS { parse_ts(f) } else { parse_ts(f).map(|t| t.div_euclid(1000)) };
         }
         let i = ((y - TY0) * 12 + mo - 1) as usize;
         let ms = *MONTH_START.get_unchecked(i) as i64;
@@ -1085,8 +1090,19 @@ unsafe fn iso_ts_avx2(f: &[u8]) -> Option<i64> {
                 return None;
             }
         }
-        Some(t * 1000)
+        Some(if MS { t * 1000 } else { t })
     }
+}
+
+/// ingest_ts in whole seconds: always F1 by the rules, so that is the fast
+/// path; anything else goes through parse_ts (floored to seconds).
+#[inline(always)]
+pub fn parse_ingest_secs(f: &[u8], end: *const u8) -> Option<i64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if f.len() == 20 && f.as_ptr().wrapping_add(32) <= end {
+        return unsafe { iso_ts_avx2::<false>(f) };
+    }
+    parse_ts_fast(f, end).map(|t| t.div_euclid(1000))
 }
 
 /// Like parse_ts, but may read up to 32 bytes from the field start when that
@@ -1098,7 +1114,7 @@ pub fn parse_ts_fast(f: &[u8], end: *const u8) -> Option<i64> {
     if n == 20 || n == 25 {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         if p.wrapping_add(32) <= end {
-            return unsafe { iso_ts_avx2(f) };
+            return unsafe { iso_ts_avx2::<true>(f) };
         }
         // "YYYY-MM-" "DDTHH:MM" ":SS" + Z | +HH:MM
         let w0 = ld8(p);
