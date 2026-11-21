@@ -108,10 +108,14 @@ impl Ctx {
     }
 }
 
+/// (wall, user, sys) at each log point, for the probe summary
+static MARKS: Mutex<Vec<(f64, f64, f64)>> = Mutex::new(Vec::new());
+
 fn log(t0: Instant, msg: &str) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    MARKS.lock().unwrap().push((t0.elapsed().as_secs_f64(), tv(ru.ru_utime), tv(ru.ru_stime)));
     eprintln!(
         "[{:8.3}s] {}  (user {:.2}s sys {:.2}s minflt {})",
         t0.elapsed().as_secs_f64(),
@@ -551,6 +555,7 @@ fn main() {
         }
     });
     log(t0, &format!("wrote {} user_daily rows, {} campaign_daily rows", nrows, ncrows));
+    probe_hooks(nthreads, &cd);
 }
 
 const L_BITS: u32 = 6;
@@ -619,6 +624,50 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
 }
 
 /// lists: per worker, (pairs, keys per shard)
+/// Diagnostics only (used by probe.sh, never by a real run):
+/// PROBE_OUT=file appends a one-line phase summary of this run to file;
+/// PROBE_NOTES=file adds its lines as extra campaign_daily rows.
+fn probe_hooks(nthreads: usize, cd: &Path) {
+    if let Some(path) = std::env::var_os("PROBE_OUT") {
+        let m = MARKS.lock().unwrap();
+        let mut line = format!("T{}", nthreads);
+        let names = ["", "L", "P", "D", "S", "W"];
+        for i in 1..m.len().min(names.len()) {
+            line += &format!(" {}{:.2}", names[i], m[i].0 - m[i - 1].0);
+        }
+        if let Some(l) = m.last() {
+            line += &format!(" ={:.2} u{:.1} s{:.1}", l.0, l.1, l.2);
+        }
+        let line = line.replace(" L0.", " L.").replace(" P0.", " P.").replace(" D0.", " D.").replace(" S0.", " S.").replace(" W0.", " W.").replace(" =0.", " =.");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+    if let Some(path) = std::env::var_os("PROBE_NOTES") {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let mut c = vec![
+            pq::Column::new("campaign_id", pq::Kind::Str, 0),
+            pq::Column::new("channel", pq::Kind::Str, 0),
+            pq::Column::new("day", pq::Kind::Date, 0),
+            pq::Column::new("sessions", pq::Kind::I64, 0),
+            pq::Column::new("purchasing_sessions", pq::Kind::I64, 0),
+            pq::Column::new("revenue_cents", pq::Kind::I64, 0),
+            pq::Column::new("assisted_sessions", pq::Kind::I64, 0),
+        ];
+        for (i, l) in lines.iter().enumerate() {
+            c[0].push_str(format!("{} {}", i, l).as_bytes());
+            c[1].push_str(b"probe");
+            c[2].push_i32(0);
+            for k in 3..7 {
+                c[k].push_i64(0);
+            }
+        }
+        let _ = pq::write(&cd.join("zz-probe.parquet"), lines.len(), &c);
+    }
+}
+
 fn build_links(nthreads: usize, lists: &[LinkParse]) -> LinkMap {
     let ns = 1usize << L_BITS;
     // L1: dense ids per shard
