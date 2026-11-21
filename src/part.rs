@@ -15,13 +15,23 @@ const HUGE: usize = 2 << 20;
 
 static FREE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-fn get_block() -> *mut u8 {
-    {
-        let mut f = FREE.lock().unwrap();
-        if let Some(p) = f.pop() {
-            return p as *mut u8;
+/// Per-thread cache of free blocks, so workers rarely touch the global lock.
+/// A thread hands its leftovers back to the global pool when it exits.
+struct LocalCache(Vec<usize>);
+
+impl Drop for LocalCache {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            FREE.lock().unwrap().extend_from_slice(&self.0);
         }
     }
+}
+
+thread_local! {
+    static CACHE: std::cell::RefCell<LocalCache> = const { std::cell::RefCell::new(LocalCache(Vec::new())) };
+}
+
+fn new_arena(into: &mut Vec<usize>) {
     unsafe {
         let raw = libc::mmap(
             std::ptr::null_mut(),
@@ -36,12 +46,30 @@ fn get_block() -> *mut u8 {
         if crate::alloc::HUGE.load(std::sync::atomic::Ordering::Relaxed) {
             libc::madvise(a as *mut libc::c_void, ARENA, libc::MADV_HUGEPAGE);
         }
-        let mut f = FREE.lock().unwrap();
-        for i in (1..ARENA / BLK).rev() {
-            f.push(a + i * BLK);
+        // handed out from the low end first, so pages are touched in order
+        for i in (0..ARENA / BLK).rev() {
+            into.push(a + i * BLK);
         }
-        a as *mut u8
     }
+}
+
+#[inline]
+fn get_block() -> *mut u8 {
+    CACHE.with(|c| {
+        let v = &mut c.borrow_mut().0;
+        if let Some(p) = v.pop() {
+            return p as *mut u8;
+        }
+        {
+            let mut f = FREE.lock().unwrap();
+            let k = f.len().saturating_sub(256);
+            v.extend(f.drain(k..));
+        }
+        if v.is_empty() {
+            new_arena(v);
+        }
+        v.pop().unwrap() as *mut u8
+    })
 }
 
 fn put_blocks(ps: &[usize]) {

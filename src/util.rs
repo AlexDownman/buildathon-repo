@@ -468,10 +468,11 @@ mod tests {
     fn rows_match_split() {
         let mut x = 0x2545F4914F6CDD1Du64;
         let alpha = b"ab,,\"\" \r";
-        for round in 0..3000 {
+        for round in 0..1500 {
             let mut data = b"h1,h2,h3\n".to_vec();
             let mut lines = Vec::new();
-            for _ in 0..50 {
+            let nlines = if round % 5 == 0 { 2000 } else { 50 };
+            for _ in 0..nlines {
                 x ^= x << 13; x ^= x >> 7; x ^= x << 17;
                 let n = if round % 7 == 0 { (x % 200) as usize } else { (x % 24) as usize };
                 let mut l = Vec::new();
