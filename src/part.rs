@@ -177,14 +177,17 @@ impl<T: Copy + Default, const K: usize> Parts<T, K> {
         Parts { bufs: (0..nb).map(|_| BlockVec::new(K)).collect(), stage: vec![[T::default(); K]; nb], cnt: vec![0; nb] }
     }
 
+    /// cnt[b] counts every record pushed to bucket b; the low bits are the
+    /// stage fill (K is a power of two).
     #[inline(always)]
     pub fn push(&mut self, b: usize, v: T) {
+        const { assert!(K.is_power_of_two()) };
         let c = unsafe { self.cnt.get_unchecked_mut(b) };
         let st = unsafe { self.stage.get_unchecked_mut(b) };
-        st[*c as usize] = v;
+        let j = *c as usize & (K - 1);
+        unsafe { *st.get_unchecked_mut(j) = v };
         *c += 1;
-        if *c as usize == K {
-            *c = 0;
+        if j == K - 1 {
             Self::flush_full(unsafe { self.bufs.get_unchecked_mut(b) }, st);
         }
     }
@@ -192,7 +195,7 @@ impl<T: Copy + Default, const K: usize> Parts<T, K> {
     /// Like push, returning the record's final index in bucket b.
     #[inline(always)]
     pub fn push_idx(&mut self, b: usize, v: T) -> usize {
-        let i = unsafe { self.bufs.get_unchecked(b).len() + *self.cnt.get_unchecked(b) as usize };
+        let i = unsafe { *self.cnt.get_unchecked(b) as usize };
         self.push(b, v);
         i
     }
@@ -204,7 +207,7 @@ impl<T: Copy + Default, const K: usize> Parts<T, K> {
 
     pub fn finish(mut self) -> Vec<BlockVec<T>> {
         for b in 0..self.bufs.len() {
-            let c = self.cnt[b] as usize;
+            let c = self.cnt[b] as usize & (K - 1);
             for i in 0..c {
                 let x = self.stage[b][i];
                 self.bufs[b].push(x);

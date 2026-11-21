@@ -275,6 +275,70 @@ fn read_small(p: &Path) -> Vec<u8> {
     std::fs::read(p).unwrap_or_default()
 }
 
+struct Dims {
+    products: KeyMap<u16>,
+    nprod: usize,
+    unknown_cat: u16,
+    cat_names: Vec<Vec<u8>>,
+    camps: KeyMap<u32>,
+    camp_ids: Vec<Vec<u8>>,
+    channels: Vec<Vec<u8>>,
+}
+
+/// products.csv and campaigns.csv (small; read on one thread while links load)
+fn load_dims(data: &Path) -> Dims {
+    // ---- products ----
+    // (borrowed slices, no per-row allocation: this runs on one thread)
+    let pbytes = read_small(&data.join("products.csv"));
+    let mut prows: Vec<(u128, u16)> = Vec::with_capacity(pbytes.len() / 16);
+    let mut catmap = KeyMap::<u16>::with_capacity(64);
+    let mut cat_raw: Vec<&[u8]> = Vec::new();
+    for_lines(&pbytes, 0, pbytes.len(), |line| {
+        let mut f: [&[u8]; 2] = [b""; 2];
+        if split(line, &mut f) && !f[0].is_empty() {
+            let (ci, new) = catmap.get_or_insert(key_of(f[1]), cat_raw.len() as u16);
+            if new {
+                cat_raw.push(f[1]);
+            }
+            prows.push((key_of(f[0]), ci));
+        }
+    });
+    let (unk_raw, new) = catmap.get_or_insert(key_of(b"unknown"), cat_raw.len() as u16);
+    if new {
+        cat_raw.push(b"unknown");
+    }
+    let mut order: Vec<u16> = (0..cat_raw.len() as u16).collect();
+    order.sort_by(|&a, &b| cat_raw[a as usize].cmp(cat_raw[b as usize]));
+    let mut rank = vec![0u16; cat_raw.len()];
+    for (r, &i) in order.iter().enumerate() {
+        rank[i as usize] = r as u16;
+    }
+    let cat_names: Vec<Vec<u8>> = order.iter().map(|&i| cat_raw[i as usize].to_vec()).collect();
+    let unknown_cat = rank[unk_raw as usize];
+    let mut products = KeyMap::<u16>::with_capacity(prows.len());
+    for &(id, c) in &prows {
+        products.get_or_insert(id, rank[c as usize]);
+    }
+
+    // ---- campaigns ----
+    let cbytes = read_small(&data.join("campaigns.csv"));
+    let mut camps = KeyMap::<u32>::with_capacity(4096);
+    let mut camp_ids = Vec::new();
+    let mut channels = Vec::new();
+    for_lines(&cbytes, 0, cbytes.len(), |line| {
+        let mut f: [&[u8]; 2] = [b""; 2];
+        if split(line, &mut f) && !f[0].is_empty() {
+            let (_, new) = camps.get_or_insert(key_of(f[0]), camp_ids.len() as u32);
+            if new {
+                camp_ids.push(f[0].to_vec());
+                channels.push(f[1].to_vec());
+            }
+        }
+    });
+
+    Dims { products, nprod: prows.len(), unknown_cat, cat_names, camps, camp_ids, channels }
+}
+
 fn main() {
     let t0 = Instant::now();
     if let Some(dir) = std::env::var_os("PROBE_MICRO") {
@@ -298,73 +362,47 @@ fn main() {
     let day0 = ws.div_euclid(DAY_MS);
     let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1).max(1) as usize;
 
-    // ---- products ----
-    let pbytes = read_small(&data.join("products.csv"));
-    let mut prows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for_lines(&pbytes, 0, pbytes.len(), |line| {
-        let mut f: [&[u8]; 2] = [b""; 2];
-        if split(line, &mut f) && !f[0].is_empty() {
-            prows.push((f[0].to_vec(), f[1].to_vec()));
-        }
+    // ---- products + campaigns (one thread) alongside links ----
+    log(t0, "start");
+    let (link, npairs, dims) = std::thread::scope(|scope| {
+        let dims_h = scope.spawn(|| load_dims(&data));
+        // ---- links ----
+        let links_in = Input::open(&data.join("links"));
+        let link_chunks = links_in.chunks();
+        let pair_lists = par_for(
+            nthreads,
+            link_chunks.len(),
+            || LinkParse { pairs: Vec::new(), keys: (0..1usize << L_BITS).map(|_| Vec::new()).collect(), buf: Vec::new() },
+            |lp, i| {
+                let (fi, s, e) = link_chunks[i];
+                let (s, e) = links_in.read(fi, s, e, &mut lp.buf);
+                let d = &lp.buf[..];
+                let end = d.as_ptr_range().end;
+                let (pairs, keys) = (&mut lp.pairs, &mut lp.keys);
+                for_rows::<2>(d, s, e, |f| {
+                    if !f[0].is_empty() && !f[1].is_empty() {
+                        let a = key_fast(f[0], end);
+                        let b = key_fast(f[1], end);
+                        // each side is recorded as (shard << 32 | position in this worker's shard list)
+                        let sa = (hash128(a) >> (64 - L_BITS)) as usize;
+                        let sb = (hash128(b) >> (64 - L_BITS)) as usize;
+                        let ca = ((sa as u64) << 32) | keys[sa].len() as u64;
+                        keys[sa].push(a);
+                        let cb = ((sb as u64) << 32) | keys[sb].len() as u64;
+                        keys[sb].push(b);
+                        pairs.push((ca, cb));
+                    }
+                });
+            },
+        );
+        let npairs: usize = pair_lists.iter().map(|v| v.pairs.len()).sum();
+        let link = build_links(nthreads, &pair_lists);
+        drop(pair_lists);
+        (link, npairs, dims_h.join().unwrap())
     });
-    let mut cat_names: Vec<Vec<u8>> = prows.iter().map(|r| r.1.clone()).collect();
-    cat_names.push(b"unknown".to_vec());
-    cat_names.sort();
-    cat_names.dedup();
-    let cat_rank = |n: &[u8]| cat_names.binary_search_by(|x| x.as_slice().cmp(n)).unwrap() as u16;
-    let unknown_cat = cat_rank(b"unknown");
-    let mut products = KeyMap::<u16>::with_capacity(prows.len());
-    for (id, c) in &prows {
-        products.get_or_insert(key_of(id), cat_rank(c));
-    }
-
-    // ---- campaigns ----
-    let cbytes = read_small(&data.join("campaigns.csv"));
-    let mut camps = KeyMap::<u32>::with_capacity(4096);
-    let mut camp_ids = Vec::new();
-    let mut channels = Vec::new();
-    for_lines(&cbytes, 0, cbytes.len(), |line| {
-        let mut f: [&[u8]; 2] = [b""; 2];
-        if split(line, &mut f) && !f[0].is_empty() {
-            let (_, new) = camps.get_or_insert(key_of(f[0]), camp_ids.len() as u32);
-            if new {
-                camp_ids.push(f[0].to_vec());
-                channels.push(f[1].to_vec());
-            }
-        }
-    });
-    log(t0, &format!("products {} cats {} campaigns {}", prows.len(), cat_names.len(), camp_ids.len()));
-
-    // ---- links ----
-    let links_in = Input::open(&data.join("links"));
-    let link_chunks = links_in.chunks();
-    let pair_lists = par_for(
-        nthreads,
-        link_chunks.len(),
-        || LinkParse { pairs: Vec::new(), keys: (0..1usize << L_BITS).map(|_| Vec::new()).collect(), buf: Vec::new() },
-        |lp, i| {
-            let (fi, s, e) = link_chunks[i];
-            let (s, e) = links_in.read(fi, s, e, &mut lp.buf);
-            let d = &lp.buf[..];
-            let end = d.as_ptr_range().end;
-            let (pairs, keys) = (&mut lp.pairs, &mut lp.keys);
-            for_rows::<2>(d, s, e, |f| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    let a = key_fast(f[0], end);
-                    let b = key_fast(f[1], end);
-                    pairs.push((a, b));
-                    let ha = hash128(a);
-                    let hb = hash128(b);
-                    keys[(ha >> (64 - L_BITS)) as usize].push(a);
-                    keys[(hb >> (64 - L_BITS)) as usize].push(b);
-                }
-            });
-        },
-    );
-    let npairs: usize = pair_lists.iter().map(|v| v.pairs.len()).sum();
-    let link = build_links(nthreads, &pair_lists);
-    drop(pair_lists);
     log(t0, &format!("links: {} pairs, {} linked ids", npairs, link.len()));
+    let Dims { products, nprod, unknown_cat, cat_names, camps, camp_ids, channels } = dims;
+    eprintln!("           products {} cats {} campaigns {}", nprod, cat_names.len(), camp_ids.len());
 
     let ctx = Ctx {
         ws,
@@ -563,38 +601,63 @@ fn main() {
 const L_BITS: u32 = 6;
 
 /// ID -> person name, sharded by the top hash bits so it can be built in parallel.
+/// ID -> person name, for ids whose name is another id. One table split into
+/// 2^L_BITS regions (top hash bits pick the region, linear probing wraps
+/// inside it), so the regions are built in parallel yet form one allocation.
 struct LinkMap {
-    shards: Vec<KeyMap<u128>>,
+    slots: Vec<(u128, u128)>,
+    rbits: u32, // log2 of the region size
     len: usize,
 }
 
 impl LinkMap {
     #[inline(always)]
-    fn shard(&self, h: u64) -> &KeyMap<u128> {
-        unsafe { self.shards.get_unchecked((h >> (64 - L_BITS)) as usize) }
+    fn start(&self, h: u64) -> usize {
+        (h >> (64 - L_BITS - self.rbits)) as usize
     }
     #[inline(always)]
     fn prefetch(&self, h: u64) {
-        self.shard(h).prefetch(h)
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let p = self.slots.as_ptr().add(self.start(h)) as *const i8;
+            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+        }
     }
     #[inline(always)]
     fn get_h(&self, k: u128, h: u64) -> Option<u128> {
-        self.shard(h).get_h(k, h)
+        let i0 = self.start(h);
+        let rmask = (1usize << self.rbits) - 1;
+        let base = i0 & !rmask;
+        let mut j = i0 & rmask;
+        loop {
+            let s = unsafe { self.slots.get_unchecked(base | j) };
+            if s.0 == k {
+                return Some(s.1);
+            }
+            if s.0 == 0 {
+                return None;
+            }
+            j = (j + 1) & rmask;
+        }
     }
     fn len(&self) -> usize {
         self.len
     }
 }
 
-/// Collects results of f(task) in task order.
-fn par_map<R: Send, F: Fn(usize) -> R + Sync>(nthreads: usize, ntasks: usize, f: F) -> Vec<R> {
-    let mut v: Vec<(usize, R)> = par_for(nthreads, ntasks, Vec::new, |acc: &mut Vec<(usize, R)>, i| acc.push((i, f(i))))
-        .into_iter()
-        .flatten()
-        .collect();
+/// Like par_map, with per-thread scratch state.
+fn par_map_st<R: Send, T: Send, I: Fn() -> T + Sync, F: Fn(&mut T, usize) -> R + Sync>(nthreads: usize, ntasks: usize, init: I, f: F) -> Vec<R> {
+    let mut v: Vec<(usize, R)> = par_for(nthreads, ntasks, || (init(), Vec::new()), |st: &mut (T, Vec<(usize, R)>), i| {
+        let r = f(&mut st.0, i);
+        st.1.push((i, r));
+    })
+    .into_iter()
+    .flat_map(|x| x.1)
+    .collect();
     v.sort_unstable_by_key(|x| x.0);
     v.into_iter().map(|x| x.1).collect()
 }
+
 
 fn uf_find(p: &[AtomicU32], mut x: u32) -> u32 {
     loop {
@@ -868,51 +931,94 @@ fn probe_micro(dir: &Path) {
     eprintln!("{}", out);
 }
 
+/// Shared output array written in disjoint ranges by parallel tasks.
+#[derive(Clone, Copy)]
+struct SyncPtr<T>(*mut T);
+unsafe impl<T> Send for SyncPtr<T> {}
+unsafe impl<T> Sync for SyncPtr<T> {}
+
 fn build_links(nthreads: usize, lists: &[LinkParse]) -> LinkMap {
     let ns = 1usize << L_BITS;
-    // L1: dense ids per shard
-    let shard_maps: Vec<(KeyMap<u128>, Vec<u128>)> = par_map(nthreads, ns, |s| {
-        let n: usize = lists.iter().map(|l| l.keys[s].len()).sum();
-        let mut m = KeyMap::<u128>::with_capacity(n + 16);
-        let mut keys = Vec::with_capacity(n / 2 + 16);
+    let nl = lists.len();
+    // occurrence counts per shard; shard s owns global slots [occ[s], occ[s+1])
+    // of every per-id array (sized by occurrences, an upper bound on ids)
+    let mut occ = Vec::with_capacity(ns + 1);
+    let mut acc = 0usize;
+    for s in 0..ns {
+        occ.push(acc);
+        acc += lists.iter().map(|l| l.keys[s].len()).sum::<usize>();
+    }
+    occ.push(acc);
+    let nocc = acc;
+    let mut keys: Vec<u128> = Vec::with_capacity(nocc);
+    let mut ids: Vec<u32> = Vec::with_capacity(nocc);
+    let kp = SyncPtr(keys.as_mut_ptr());
+    let ip = SyncPtr(ids.as_mut_ptr());
+    // L1: per shard, global ids of distinct keys and the id of every occurrence
+    // (occurrence order: workers in order, each worker's shard list in order)
+    let nuniq: Vec<usize> = par_map_st(nthreads, ns, Vec::new, |table: &mut Vec<u32>, s| {
+        let (kp, ip) = (kp, ip);
+        let base = occ[s];
+        let total = occ[s + 1] - base;
+        let cap = (total.max(8) * 2).next_power_of_two();
+        let mask = cap - 1;
+        table.clear();
+        table.resize(cap, u32::MAX);
+        let mut nu = 0usize;
+        let mut w = base;
         for l in lists {
             for &k in &l.keys[s] {
-                let (_, new) = m.get_or_insert_h(k, hash128(k), keys.len() as u128);
-                if new {
-                    keys.push(k);
-                }
+                let mut i = (hash128(k) as usize) & mask;
+                let id = loop {
+                    let e = unsafe { *table.get_unchecked(i) };
+                    if e == u32::MAX {
+                        let id = (base + nu) as u32;
+                        unsafe {
+                            *table.get_unchecked_mut(i) = id;
+                            kp.0.add(base + nu).write(k);
+                        }
+                        nu += 1;
+                        break id;
+                    }
+                    if unsafe { *kp.0.add(e as usize) } == k {
+                        break e;
+                    }
+                    i = (i + 1) & mask;
+                };
+                unsafe { ip.0.add(w).write(id) };
+                w += 1;
             }
         }
-        (m, keys)
+        nu
     });
-    let mut off = Vec::with_capacity(ns + 1);
-    let mut acc = 0usize;
-    for (_, k) in &shard_maps {
-        off.push(acc);
-        acc += k.len();
+    unsafe {
+        keys.set_len(nocc);
+        ids.set_len(nocc);
     }
-    let n = acc;
-    let mut keys: Vec<u128> = Vec::with_capacity(n);
-    for (_, k) in &shard_maps {
-        keys.extend_from_slice(k);
+    // start of worker t's occurrences of shard s: occ[s] + sum of earlier workers'
+    let mut wstart = vec![0usize; ns * nl];
+    for s in 0..ns {
+        let mut a = occ[s];
+        for (t, l) in lists.iter().enumerate() {
+            wstart[s * nl + t] = a;
+            a += l.keys[s].len();
+        }
     }
-    let gid = |k: u128| -> u32 {
-        let h = hash128(k);
-        let s = (h >> (64 - L_BITS)) as usize;
-        (off[s] + shard_maps[s].0.get_h(k, h).unwrap() as usize) as u32
+    let gid = |t: usize, c: u64| -> u32 {
+        let s = (c >> 32) as usize;
+        unsafe { *ids.get_unchecked(*wstart.get_unchecked(s * nl + t) + (c as u32) as usize) }
     };
-    // L2: concurrent union-find
-    let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
-    par_for(nthreads, lists.len(), || (), |_, i| {
-        for &(a, b) in &lists[i].pairs {
-            uf_union(&parent, gid(a), gid(b));
+    // L2: concurrent union-find over global ids
+    let parent: Vec<AtomicU32> = (0..nocc as u32).map(AtomicU32::new).collect();
+    par_for(nthreads, nl, || (), |_, t| {
+        for &(a, b) in &lists[t].pairs {
+            uf_union(&parent, gid(t, a), gid(t, b));
         }
     });
     // L3: smallest key per component
-    let minidx: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
-    let step = 1 << 16;
-    par_for(nthreads, n.div_ceil(step), || (), |_, t| {
-        for i in t * step..((t + 1) * step).min(n) {
+    let minidx: Vec<AtomicU32> = (0..nocc).map(|_| AtomicU32::new(u32::MAX)).collect();
+    par_for(nthreads, ns, || (), |_, s| {
+        for i in occ[s]..occ[s] + nuniq[s] {
             let r = uf_find(&parent, i as u32) as usize;
             let m = &minidx[r];
             let mut cur = m.load(AO::Acquire);
@@ -927,31 +1033,40 @@ fn build_links(nthreads: usize, lists: &[LinkParse]) -> LinkMap {
             }
         }
     });
-    // L4: values become the person name
-    let mut maps: Vec<KeyMap<u128>> = shard_maps.into_iter().map(|x| x.0).collect();
-    let per = ns.div_ceil(nthreads);
-    std::thread::scope(|sc| {
-        for (ci, chunk) in maps.chunks_mut(per).enumerate() {
-            let (parent, minidx, keys, off) = (&parent, &minidx, &keys, &off);
-            sc.spawn(move || {
-                for (j, m) in chunk.iter_mut().enumerate() {
-                    let base = off[ci * per + j];
-                    for slot in m.slots_mut() {
-                        if slot.0 != 0 {
-                            let g = base + slot.1 as usize;
-                            let r = uf_find(parent, g as u32) as usize;
-                            slot.1 = keys[minidx[r].load(AO::Relaxed) as usize];
-                        }
-                    }
+    // L4: the lookup map holds only ids whose person name is another id
+    let n: usize = nuniq.iter().sum();
+    let mut rbits = 3u32;
+    for s in 0..ns {
+        while (1usize << rbits) < 2 * nuniq[s] {
+            rbits += 1;
+        }
+    }
+    let rsize = 1usize << rbits;
+    let mut slots: Vec<(u128, u128)> = vec![(0, 0); rsize * ns];
+    let sp = SyncPtr(slots.as_mut_ptr());
+    let rmask = rsize - 1;
+    par_for(nthreads, ns, || (), |_, s| {
+        let sp = sp;
+        let reg = unsafe { std::slice::from_raw_parts_mut(sp.0.add(s * rsize), rsize) };
+        for i in occ[s]..occ[s] + nuniq[s] {
+            let r = uf_find(&parent, i as u32) as usize;
+            let mi = minidx[r].load(AO::Relaxed) as usize;
+            if mi != i {
+                let k = keys[i];
+                let h = hash128(k);
+                let mut j = ((h >> (64 - L_BITS - rbits)) as usize) & rmask;
+                while reg[j].0 != 0 {
+                    j = (j + 1) & rmask;
                 }
-            });
+                reg[j] = (k, keys[mi]);
+            }
         }
     });
-    LinkMap { shards: maps, len: n }
+    LinkMap { slots, rbits, len: n }
 }
 
 struct LinkParse {
-    pairs: Vec<(u128, u128)>,
+    pairs: Vec<(u64, u64)>,
     keys: Vec<Vec<u128>>,
     buf: Vec<u8>,
 }
@@ -983,21 +1098,24 @@ struct PendEv {
     kind: u8,
 }
 
+#[inline(always)]
+fn finish_ev<const K: usize>(ctx: &Ctx, wid: usize, p: &PendEv, outk: &mut Parts<DKey, K>, outp: &mut Parts<EvOut, K>) {
+    let (pkey, ph) = match ctx.link.get_h(p.ukey, p.hu) {
+        Some(n) => (n, p_hash(n)),
+        None => (p.ukey, p.hu),
+    };
+    let pb = (ph >> (64 - P_BITS.load(AO::Relaxed))) as usize;
+    let i = outp.push_idx(pb, EvOut { pkey, ts: p.ts, price: p.price, cat: p.cat, kind: p.kind });
+    let loc = mkloc(wid, pb, i);
+    outk.push(p.b as usize, DKey { k0: p.ekey as u64, k1: (p.ekey >> 64) as u64, ingest: p.ingest, loc });
+}
+
 fn parse_events<const K: usize>(d: &[u8], s: usize, e: usize, ctx: &Ctx, wid: usize, outk: &mut Parts<DKey, K>, outp: &mut Parts<EvOut, K>) {
     let end = d.as_ptr_range().end;
     let mut ring = [PendEv::default(); RING];
     let mut cnt = 0usize;
-    let finish = |p: &PendEv, outk: &mut Parts<DKey, K>, outp: &mut Parts<EvOut, K>| {
-        let (pkey, ph) = match ctx.link.get_h(p.ukey, p.hu) {
-            Some(n) => (n, p_hash(n)),
-            None => (p.ukey, p.hu),
-        };
-        let pb = (ph >> (64 - P_BITS.load(AO::Relaxed))) as usize;
-        let i = outp.push_idx(pb, EvOut { pkey, ts: p.ts, price: p.price, cat: p.cat, kind: p.kind });
-        let loc = mkloc(wid, pb, i);
-        outk.push(p.b as usize, DKey { k0: p.ekey as u64, k1: (p.ekey >> 64) as u64, ingest: p.ingest, loc });
-    };
-    for_rows::<7>(d, s, e, |f| {
+    let finish = |p: &PendEv, outk: &mut Parts<DKey, K>, outp: &mut Parts<EvOut, K>| finish_ev(ctx, wid, p, outk, outp);
+    for_rows::<7>(d, s, e, #[inline(always)] |f| {
         let [eid, uid, ts, ing, et, pid, price] = *f;
         if eid.is_empty() {
             return;
@@ -1063,19 +1181,22 @@ struct PendCl {
     camp: u32,
 }
 
+#[inline(always)]
+fn finish_cl(ctx: &Ctx, p: &PendCl, out: &mut Parts<ClRec, 4>) {
+    let (pkey, ph) = match ctx.link.get_h(p.ukey, p.hu) {
+        Some(n) => (n, p_hash(n)),
+        None => (p.ukey, p.hu),
+    };
+    out.push((ph >> (64 - P_BITS.load(AO::Relaxed))) as usize, ClRec { pkey, ckey: p.ckey, ts: p.ts, camp: p.camp });
+}
+
 fn parse_clicks(d: &[u8], s: usize, e: usize, ctx: &Ctx, out: &mut Parts<ClRec, 4>) {
     let end = d.as_ptr_range().end;
     let lo = ctx.ws - WEEK_MS;
     let mut ring = [PendCl::default(); RING];
     let mut cnt = 0usize;
-    let finish = |p: &PendCl, out: &mut Parts<ClRec, 4>| {
-        let (pkey, ph) = match ctx.link.get_h(p.ukey, p.hu) {
-            Some(n) => (n, p_hash(n)),
-            None => (p.ukey, p.hu),
-        };
-        out.push((ph >> (64 - P_BITS.load(AO::Relaxed))) as usize, ClRec { pkey, ckey: p.ckey, ts: p.ts, camp: p.camp });
-    };
-    for_rows::<4>(d, s, e, |f| {
+    let finish = |p: &PendCl, out: &mut Parts<ClRec, 4>| finish_cl(ctx, p, out);
+    for_rows::<4>(d, s, e, #[inline(always)] |f| {
         let [cid, uid, camp, ts] = *f;
         if cid.is_empty() || uid.is_empty() {
             return;
@@ -1192,7 +1313,8 @@ struct Scratch {
     starts: Vec<i64>,
     days: Vec<u32>,
     runs: Vec<(u32, u32, u32)>, // (day, first session, end session)
-    ct: Vec<(u32, i64)>,
+    win: Vec<(i64, i64)>,       // open click window per campaign, MIN = none
+    wtouched: Vec<u32>,
     catsum: Vec<i64>,
     touched: Vec<u16>,
     // grouping
@@ -1201,24 +1323,86 @@ struct Scratch {
     pid: Vec<u32>,
     eoff: Vec<u32>,
     coff: Vec<u32>,
-    evs: Vec<EvOut>,
+    ek64: Vec<u64>,
+    ek128: Vec<u128>,
+    sorted64: Vec<u64>,
+    sorted128: Vec<u128>,
+    radix: Vec<u64>,
+    purch: Vec<(u32, u16)>, // (price, category) of purchases, payload = index + 1
     cls: Vec<ClRec>,
-    skeys: Vec<u64>,
-    skeys2: Vec<u64>,
-    tmp: Vec<EvOut>,
     pos: Vec<u32>,
+    pratio: f64, // persons per event row in the last bucket (sizes the next table)
 }
 
-/// LSD radix sort of u64 keys by their top 31 bits (3 passes of 11 bits).
-fn radix_sort_hi31(a: &mut Vec<u64>, b: &mut Vec<u64>) {
+/// An event inside the person phase: time offset from window_start, then a
+/// payload (0, or 1 + index of the purchase in Scratch::purch). Ordering is by
+/// time first; the order of equal times does not matter.
+trait EKey: Copy + Ord + Send {
+    fn make(off: u64, payload: u32) -> Self;
+    fn off(self) -> i64;
+    fn payload(self) -> u32;
+    fn vecs(sc: &mut Scratch) -> (&mut Vec<Self>, &mut Vec<Self>);
+    fn sort(v: &mut [Self], tmp: &mut Vec<u64>);
+}
+
+impl EKey for u64 {
+    #[inline(always)]
+    fn make(off: u64, payload: u32) -> Self {
+        (off << 32) | payload as u64
+    }
+    #[inline(always)]
+    fn off(self) -> i64 {
+        (self >> 32) as i64
+    }
+    #[inline(always)]
+    fn payload(self) -> u32 {
+        self as u32
+    }
+    fn vecs(sc: &mut Scratch) -> (&mut Vec<Self>, &mut Vec<Self>) {
+        (&mut sc.ek64, &mut sc.sorted64)
+    }
+    #[inline(always)]
+    fn sort(v: &mut [Self], tmp: &mut Vec<u64>) {
+        if v.len() > 2048 {
+            radix_sort_hi32(v, tmp);
+        } else {
+            v.sort_unstable();
+        }
+    }
+}
+
+impl EKey for u128 {
+    #[inline(always)]
+    fn make(off: u64, payload: u32) -> Self {
+        ((off as u128) << 32) | payload as u128
+    }
+    #[inline(always)]
+    fn off(self) -> i64 {
+        (self >> 32) as i64
+    }
+    #[inline(always)]
+    fn payload(self) -> u32 {
+        self as u32
+    }
+    fn vecs(sc: &mut Scratch) -> (&mut Vec<Self>, &mut Vec<Self>) {
+        (&mut sc.ek128, &mut sc.sorted128)
+    }
+    #[inline(always)]
+    fn sort(v: &mut [Self], _tmp: &mut Vec<u64>) {
+        v.sort_unstable();
+    }
+}
+
+/// LSD radix sort of u64 keys by their top 32 bits (passes of 11, 11, 10 bits).
+fn radix_sort_hi32(a: &mut [u64], tmp: &mut Vec<u64>) {
     let n = a.len();
-    b.clear();
-    b.resize(n, 0);
+    tmp.clear();
+    tmp.resize(n, 0);
     let mut cnt = [[0u32; 2048]; 3];
     for &k in a.iter() {
-        cnt[0][((k >> 33) & 2047) as usize] += 1;
-        cnt[1][((k >> 44) & 2047) as usize] += 1;
-        cnt[2][((k >> 55) & 2047) as usize] += 1;
+        cnt[0][((k >> 32) & 2047) as usize] += 1;
+        cnt[1][((k >> 43) & 2047) as usize] += 1;
+        cnt[2][(k >> 54) as usize] += 1;
     }
     for c in cnt.iter_mut() {
         let mut s = 0u32;
@@ -1228,8 +1412,8 @@ fn radix_sort_hi31(a: &mut Vec<u64>, b: &mut Vec<u64>) {
             s += v;
         }
     }
-    for (pass, sh) in [33u32, 44, 55].into_iter().enumerate() {
-        let (src, dst) = if pass % 2 == 0 { (&*a, &mut *b) } else { (&*b, &mut *a) };
+    for (pass, sh) in [32u32, 43, 54].into_iter().enumerate() {
+        let (src, dst): (&[u64], &mut [u64]) = if pass % 2 == 0 { (&*a, &mut tmp[..]) } else { (&tmp[..], &mut *a) };
         let c = &mut cnt[pass];
         for &k in src.iter() {
             let d = ((k >> sh) & 2047) as usize;
@@ -1237,7 +1421,7 @@ fn radix_sort_hi31(a: &mut Vec<u64>, b: &mut Vec<u64>) {
             c[d] += 1;
         }
     }
-    std::mem::swap(a, b); // 3 passes: result is in b
+    a.copy_from_slice(tmp); // 3 passes: result is in tmp
 }
 
 impl Scratch {
@@ -1246,7 +1430,8 @@ impl Scratch {
             starts: vec![],
             days: vec![],
             runs: vec![],
-            ct: vec![],
+            win: vec![],
+            wtouched: vec![],
             catsum: vec![0; ncat],
             touched: vec![],
             table: vec![],
@@ -1254,12 +1439,15 @@ impl Scratch {
             pid: vec![],
             eoff: vec![],
             coff: vec![],
-            evs: vec![],
+            ek64: vec![],
+            ek128: vec![],
+            sorted64: vec![],
+            sorted128: vec![],
+            radix: vec![],
+            purch: vec![],
             cls: vec![],
-            skeys: vec![],
-            skeys2: vec![],
-            tmp: vec![],
             pos: vec![],
+            pratio: 0.0625,
         }
     }
 }
@@ -1274,12 +1462,34 @@ fn process_bucket(
     rows: &mut Vec<URow>,
     camp: &mut [[i64; 4]],
 ) {
+    // event times as 32-bit offsets when the window allows (it nearly always does)
+    if ctx.we - ctx.ws <= u32::MAX as i64 {
+        process_bucket_k::<u64>(evsrc, clsrc, ctx, sc, rows, camp)
+    } else {
+        process_bucket_k::<u128>(evsrc, clsrc, ctx, sc, rows, camp)
+    }
+}
+
+fn process_bucket_k<K: EKey>(
+    evsrc: &[&[EvOut]],
+    clsrc: &[&[ClRec]],
+    ctx: &Ctx,
+    sc: &mut Scratch,
+    rows: &mut Vec<URow>,
+    camp: &mut [[i64; 4]],
+) {
     let n: usize = evsrc.iter().map(|s| s.len()).sum(); // upper bound (includes dead rows)
     if n == 0 {
         return;
     }
-    // ---- events: person ids via a local hash table, counted as we go ----
-    let mut cap = ((n / 8).max(64)).next_power_of_two();
+    let ws = ctx.ws;
+    // ---- events: person ids via a local hash table, counted as we go; each
+    // live event becomes a compact key (time offset, purchase payload) ----
+    let mut cap = (((n as f64 * sc.pratio * 2.0) as usize + 1).max(64)).next_power_of_two();
+    let (mut ekeys, mut sorted) = {
+        let (a, b) = K::vecs(sc);
+        (std::mem::take(a), std::mem::take(b))
+    };
     'retry: loop {
         let mask = cap - 1;
         sc.table.clear();
@@ -1288,6 +1498,8 @@ fn process_bucket(
         sc.pid.clear();
         sc.eoff.clear();
         sc.eoff.push(0);
+        sc.purch.clear();
+        ekeys.clear();
         for sl in evsrc {
             for e in sl.iter() {
                 if e.kind == K_INVALID {
@@ -1315,39 +1527,39 @@ fn process_bucket(
                 };
                 unsafe { *sc.eoff.get_unchecked_mut(id as usize + 1) += 1 };
                 sc.pid.push(id);
+                let payload = if e.kind == K_PURCHASE {
+                    sc.purch.push((e.price, e.cat));
+                    sc.purch.len() as u32
+                } else {
+                    0
+                };
+                ekeys.push(K::make((e.ts - ws) as u64, payload));
             }
         }
         break;
     }
     let np = sc.pkeys.len();
     let mask = cap - 1;
+    sc.pratio = np as f64 / n as f64;
     for i in 0..np {
         sc.eoff[i + 1] += sc.eoff[i];
     }
     let nv = sc.eoff[np] as usize;
     // counting-sort scatter (every slot in 0..nv is written exactly once)
-    sc.evs.clear();
-    sc.evs.reserve(nv);
+    sorted.clear();
+    sorted.reserve(nv);
     sc.pos.clear();
     sc.pos.extend_from_slice(&sc.eoff[..np]);
     {
-        let dst = sc.evs.as_mut_ptr();
-        let mut j = 0usize;
-        for sl in evsrc {
-            for e in sl.iter() {
-                if e.kind == K_INVALID {
-                    continue;
-                }
-                unsafe {
-                    let id = *sc.pid.get_unchecked(j) as usize;
-                    let p = sc.pos.get_unchecked_mut(id);
-                    dst.add(*p as usize).write(*e);
-                    *p += 1;
-                }
-                j += 1;
+        let dst = sorted.as_mut_ptr();
+        for (&id, &k) in sc.pid.iter().zip(ekeys.iter()) {
+            unsafe {
+                let p = sc.pos.get_unchecked_mut(id as usize);
+                dst.add(*p as usize).write(k);
+                *p += 1;
             }
         }
-        unsafe { sc.evs.set_len(nv) };
+        unsafe { sorted.set_len(nv) };
     }
     // ---- clicks of persons that have events ----
     sc.pid.clear();
@@ -1399,38 +1611,39 @@ fn process_bucket(
         }
         unsafe { sc.cls.set_len(nc) };
     }
-    let evs_s = std::mem::take(&mut sc.evs);
-    let mut evs_s = evs_s;
     let mut cls_s = std::mem::take(&mut sc.cls);
     for id in 0..np {
         let (ea, eb) = (sc.eoff[id] as usize, sc.eoff[id + 1] as usize);
         let (ca, cb) = (sc.coff[id] as usize, sc.coff[id + 1] as usize);
-        let pe = &mut evs_s[ea..eb];
-        if pe.len() > 24 {
-            // sort compact u64 keys (time offset, index), then permute
-            let ws = ctx.ws;
-            sc.skeys.clear();
-            sc.skeys.extend(pe.iter().enumerate().map(|(i, e)| (((e.ts - ws) as u64) << 33) | i as u64));
-            if pe.len() > 2048 {
-                radix_sort_hi31(&mut sc.skeys, &mut sc.skeys2);
-            } else {
-                sc.skeys.sort_unstable();
-            }
-            sc.tmp.clear();
-            sc.tmp.extend(sc.skeys.iter().map(|&k| pe[(k & ((1 << 33) - 1)) as usize]));
-            pe.copy_from_slice(&sc.tmp);
-        } else if pe.len() > 1 {
-            pe.sort_unstable_by_key(|e| e.ts);
+        let pe = &mut sorted[ea..eb];
+        if pe.len() > 1 {
+            K::sort(pe, &mut sc.radix);
         }
         let pc = &mut cls_s[ca..cb];
         if pc.len() > 1 {
-            pc.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(a.ckey, b.ckey)));
+            pc.sort_unstable_by_key(|c| c.ts);
+            // equal timestamps: order by click_id (byte-wise), needed for credit ties
+            let mut i = 0;
+            while i + 1 < pc.len() {
+                if pc[i + 1].ts == pc[i].ts {
+                    let mut j = i + 1;
+                    while j + 1 < pc.len() && pc[j + 1].ts == pc[i].ts {
+                        j += 1;
+                    }
+                    pc[i..=j].sort_unstable_by(|a, b| cmp_key(a.ckey, b.ckey));
+                    i = j + 1;
+                } else {
+                    i += 1;
+                }
+            }
         }
         let pk = sc.pkeys[id];
-        process_person(pk, &evs_s[ea..eb], &cls_s[ca..cb], ctx, sc, rows, camp);
+        process_person(pk, &sorted[ea..eb], &cls_s[ca..cb], ctx, sc, rows, camp);
     }
-    sc.evs = evs_s;
     sc.cls = cls_s;
+    let (a, b) = K::vecs(sc);
+    *a = ekeys;
+    *b = sorted;
 }
 
 #[allow(dead_code)]
@@ -1448,7 +1661,8 @@ fn credit(cls: &[ClRec], start: i64, organic: usize) -> usize {
     cls[first].camp as usize
 }
 
-fn process_person(p: u128, evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scratch, rows: &mut Vec<URow>, camp: &mut [[i64; 4]]) {
+fn process_person<K: EKey>(p: u128, evs: &[K], cls: &[ClRec], ctx: &Ctx, sc: &mut Scratch, rows: &mut Vec<URow>, camp: &mut [[i64; 4]]) {
+    let ws = ctx.ws;
     let ndays = ctx.ndays;
     let organic = ctx.ncamp();
     sc.starts.clear();
@@ -1480,8 +1694,9 @@ fn process_person(p: u128, evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scr
     }
 
     while k < n {
-        let start = evs[k].ts;
-        let mut last = start;
+        let soff = evs[k].off();
+        let start = ws + soff;
+        let mut last = soff;
         let mut cnt = 0i64;
         let mut rev = 0i64;
         let mut purch = false;
@@ -1493,18 +1708,20 @@ fn process_person(p: u128, evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scr
             d_ev = 0;
             d_rev = 0;
         }
-        while k < n && evs[k].ts - last <= GAP_MS {
-            let e = &evs[k];
-            last = e.ts;
+        while k < n && evs[k].off() - last <= GAP_MS {
+            let e = evs[k];
+            last = e.off();
             cnt += 1;
-            if e.kind == K_PURCHASE {
-                rev += e.price as i64;
+            let pl = e.payload();
+            if pl != 0 {
+                let (price, cat) = unsafe { *sc.purch.get_unchecked(pl as usize - 1) };
+                rev += price as i64;
                 purch = true;
-                let c = e.cat as usize;
+                let c = cat as usize;
                 if sc.catsum[c] == 0 {
-                    sc.touched.push(e.cat);
+                    sc.touched.push(cat);
                 }
-                sc.catsum[c] += e.price as i64;
+                sc.catsum[c] += price as i64;
             }
             k += 1;
         }
@@ -1544,9 +1761,6 @@ fn process_person(p: u128, evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scr
             _ => sc.runs.push((d, i as u32, i as u32 + 1)),
         }
     }
-    sc.ct.clear();
-    sc.ct.extend(cls.iter().map(|c| (c.camp, c.ts)));
-    sc.ct.sort_unstable();
     let starts = &sc.starts;
     let runs = &sc.runs;
     let mut add_range = |cp: u32, a: i64, b: i64| {
@@ -1564,25 +1778,29 @@ fn process_person(p: u128, evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scr
             ri += 1;
         }
     };
-    let ct = &sc.ct;
-    let mut g = 0;
-    while g < ct.len() {
-        let cp = ct[g].0;
-        let mut a = ct[g].1;
-        let mut b = a + WEEK_MS;
-        let mut h = g + 1;
-        while h < ct.len() && ct[h].0 == cp {
-            let t = ct[h].1;
-            if t <= b {
-                b = b.max(t + WEEK_MS);
-            } else {
-                add_range(cp, a, b);
-                a = t;
-                b = t + WEEK_MS;
-            }
-            h += 1;
+    // Clicks are in time order, so each campaign's union of windows
+    // [t, t + 7d] can be built with one open window per campaign.
+    if sc.win.len() < ctx.ncamp() {
+        sc.win.resize(ctx.ncamp(), (i64::MIN, i64::MIN));
+    }
+    sc.wtouched.clear();
+    for c in cls {
+        let cp = c.camp as usize;
+        let t = c.ts;
+        let w = &mut sc.win[cp];
+        if w.1 == i64::MIN {
+            *w = (t, t + WEEK_MS);
+            sc.wtouched.push(c.camp);
+        } else if t <= w.1 {
+            w.1 = t + WEEK_MS;
+        } else {
+            add_range(c.camp, w.0, w.1);
+            *w = (t, t + WEEK_MS);
         }
-        add_range(cp, a, b);
-        g = h;
+    }
+    for &cp in &sc.wtouched {
+        let w = sc.win[cp as usize];
+        add_range(cp, w.0, w.1);
+        sc.win[cp as usize] = (i64::MIN, i64::MIN);
     }
 }
