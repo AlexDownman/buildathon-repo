@@ -40,27 +40,34 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 static PIECE_SZ: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| env_usize("PIECE_KB", PIECE >> 10) << 10);
 
-const K_INVALID: u8 = 0;
-const K_VIEW: u8 = 1;
-const K_CART: u8 = 2;
-const K_PURCHASE: u8 = 3;
-
-/// Dedup key stream: event_id and ingest_ts (24 bytes). The payload stream
-/// (EvOut) is pushed in lockstep, so index i in both refers to one row.
+/// Dedup key stream record (24 bytes): event_id, then ingest_ts and the
+/// location of the row's payload packed in one word: x = ingest code << 37 | loc.
 #[derive(Clone, Copy, Default)]
 struct DKey {
     k0: u64,
     k1: u64,
-    ingest: i64,
-    /// where this row's payload went: (parse worker, person bucket, index), or NOLOC
-    loc: u64,
+    x: u64,
 }
 
-const NOLOC: u64 = u64::MAX;
+/// loc = parse worker (5 bits) << 32 | person bucket (12 bits) << 20 | index (20 bits)
+const LOC_MASK: u64 = (1 << 37) - 1;
+const NOLOC: u64 = LOC_MASK;
+const LOC_IDX: usize = 1 << 20;
 
 #[inline(always)]
 fn mkloc(t: usize, pb: usize, i: usize) -> u64 {
-    ((t as u64) << 59) | ((pb as u64) << 40) | i as u64
+    ((t as u64) << 32) | ((pb as u64) << 20) | i as u64
+}
+
+/// ingest_ts (always a valid F1, whole seconds) as seconds from 2^26 s before
+/// window_start, in 27 bits (a range of +-2 years around the window, clamped;
+/// the code for an unreadable value sorts last)
+#[inline(always)]
+fn ingest_code(ingest_s: Option<i64>, ws_s: i64) -> u64 {
+    match ingest_s {
+        Some(t) => ((t - ws_s + (1 << 26)).clamp(0, (1 << 27) - 2)) as u64,
+        None => (1 << 27) - 1,
+    }
 }
 
 impl DKey {
@@ -68,15 +75,74 @@ impl DKey {
     fn ekey(&self) -> u128 {
         ((self.k1 as u128) << 64) | self.k0 as u128
     }
+    #[inline(always)]
+    fn ing(&self) -> u64 {
+        self.x >> 37
+    }
+    #[inline(always)]
+    fn loc(&self) -> u64 {
+        self.x & LOC_MASK
+    }
 }
 
-#[derive(Clone, Copy, Default)]
-struct EvOut {
-    pkey: u128,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    kind: u8,
+/// Payload records, one per valid event row, in person buckets. Word 2 of a
+/// record is u64::MAX once dedup has marked it a later copy.
+trait Layout: Send + Sync + 'static {
+    type Ev: Copy + Default + Send + Sync + 'static;
+    type K: EKey;
+    /// price 0 = not a purchase
+    fn ev(pkey: u128, off: u64, price: u32, cat: u16) -> Self::Ev;
+    fn pkey(e: &Self::Ev) -> u128;
+    fn key(e: &Self::Ev) -> Self::K;
+    fn dead(e: &Self::Ev) -> bool;
+}
+
+/// 24-byte records: the usual case (window under 49 days, at most 256 categories)
+struct Narrow;
+impl Layout for Narrow {
+    type Ev = [u64; 3];
+    type K = u64;
+    #[inline(always)]
+    fn ev(pkey: u128, off: u64, price: u32, cat: u16) -> [u64; 3] {
+        let pl = if price == 0 { 0 } else { ((price as u64) << 8) | cat as u64 };
+        [pkey as u64, (pkey >> 64) as u64, (off << 32) | pl]
+    }
+    #[inline(always)]
+    fn pkey(e: &[u64; 3]) -> u128 {
+        ((e[1] as u128) << 64) | e[0] as u128
+    }
+    #[inline(always)]
+    fn key(e: &[u64; 3]) -> u64 {
+        e[2]
+    }
+    #[inline(always)]
+    fn dead(e: &[u64; 3]) -> bool {
+        e[2] == u64::MAX
+    }
+}
+
+/// 32-byte records for anything wider
+struct Wide;
+impl Layout for Wide {
+    type Ev = [u64; 4];
+    type K = u128;
+    #[inline(always)]
+    fn ev(pkey: u128, off: u64, price: u32, cat: u16) -> [u64; 4] {
+        let pl = if price == 0 { 0 } else { ((price as u64) << 16) | cat as u64 };
+        [pkey as u64, (pkey >> 64) as u64, off, pl]
+    }
+    #[inline(always)]
+    fn pkey(e: &[u64; 4]) -> u128 {
+        ((e[1] as u128) << 64) | e[0] as u128
+    }
+    #[inline(always)]
+    fn key(e: &[u64; 4]) -> u128 {
+        ((e[2] as u128) << 64) | e[3] as u128
+    }
+    #[inline(always)]
+    fn dead(e: &[u64; 4]) -> bool {
+        e[2] == u64::MAX
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -99,6 +165,7 @@ struct URow {
 struct Ctx {
     ws: i64,
     we: i64,
+    ws_s: i64, // window_start in seconds (floor)
     link: LinkMap,
     products: KeyMap<u16>,
     unknown_cat: u16,
@@ -339,10 +406,108 @@ fn load_dims(data: &Path) -> Dims {
     Dims { products, nprod: prows.len(), unknown_cat, cat_names, camps, camp_ids, channels }
 }
 
+struct POut {
+    rows: Vec<URow>,
+    camp: Vec<[i64; 4]>,
+    sc: Scratch,
+}
+
+/// parse, dedup and the per-person pass, for one payload layout
+#[allow(clippy::too_many_arguments)]
+fn events_to_persons<L: Layout>(
+    nthreads: usize,
+    t0: Instant,
+    ev_in: &Input,
+    cl_in: &Input,
+    ev_chunks: &[(usize, usize, usize)],
+    cl_chunks: &[(usize, usize, usize)],
+    ctx: &Ctx,
+    nev_b: usize,
+    np_b: usize,
+) -> Vec<POut> {
+    let parsed: Vec<Parsed<L>> = if std::env::var_os("STAGE4").is_some() {
+        run_parse::<L, 4>(nthreads, ev_in, cl_in, ev_chunks, cl_chunks, ctx, nev_b, np_b)
+    } else {
+        run_parse::<L, SK>(nthreads, ev_in, cl_in, ev_chunks, cl_chunks, ctx, nev_b, np_b)
+    };
+    let (ev_bytes, cl_bytes) = (ev_in.bytes(), cl_in.bytes());
+    // dedup keys go bucket-major (each dedup task takes its bucket and hands
+    // the blocks back); payloads stay per worker until dedup has marked losers
+    let ev_b: Vec<Mutex<Vec<BlockVec<DKey>>>> = (0..nev_b).map(|_| Mutex::new(Vec::new())).collect();
+    let cl_b: Vec<Mutex<Vec<BlockVec<ClRec>>>> = (0..np_b).map(|_| Mutex::new(Vec::new())).collect();
+    let mut pay: Vec<Vec<BlockVec<L::Ev>>> = Vec::with_capacity(parsed.len());
+    let (mut nrec, mut ncl) = (0usize, 0usize);
+    for p in parsed {
+        for (b, v) in p.evk.into_iter().enumerate() {
+            nrec += v.len();
+            ev_b[b].lock().unwrap().push(v);
+        }
+        pay.push(p.evp);
+        for (b, v) in p.cl.into_iter().enumerate() {
+            ncl += v.len();
+            cl_b[b].lock().unwrap().push(v);
+        }
+    }
+    log(t0, &format!("parsed: {} event rows, {} valid clicks ({} + {} bytes)", nrec, ncl, ev_bytes, cl_bytes));
+
+    // ---- dedup: mark every copy but the earliest as dead, in place ----
+    let killed: usize = par_for(
+        nthreads,
+        nev_b,
+        || (0usize, Vec::<u64>::new(), Vec::<u64>::new()),
+        |(k, table, losers), b| {
+            let ks = std::mem::take(&mut *ev_b[b].lock().unwrap());
+            *k += dedup_bucket(&ks, &pay, table, losers);
+            ks.into_iter().for_each(BlockVec::release);
+        },
+    )
+    .into_iter()
+    .map(|x| x.0)
+    .sum();
+    let pe_b: Vec<Mutex<Vec<BlockVec<L::Ev>>>> = (0..np_b).map(|_| Mutex::new(Vec::new())).collect();
+    let mut nsurv = 0usize;
+    for w in pay {
+        for (b, v) in w.into_iter().enumerate() {
+            nsurv += v.len();
+            pe_b[b].lock().unwrap().push(v);
+        }
+    }
+    log(t0, &format!("dedup: {} valid rows, {} later copies dropped", nsurv, killed));
+
+    // ---- per person ----
+    let ndays = ctx.ndays;
+    let ncamp_tot = ctx.ncamp() + 1;
+    let pouts = par_for(
+        nthreads,
+        np_b,
+        || POut {
+            rows: Vec::new(),
+            camp: vec![[0i64; 4]; ncamp_tot * ndays],
+            sc: Scratch::new(ctx.cat_names.len()),
+        },
+        |po, b| {
+            let ev = std::mem::take(&mut *pe_b[b].lock().unwrap());
+            let cl = std::mem::take(&mut *cl_b[b].lock().unwrap());
+            {
+                let evs: Vec<&[L::Ev]> = ev.iter().flat_map(|v| v.slices()).collect();
+                let cls: Vec<&[ClRec]> = cl.iter().flat_map(|v| v.slices()).collect();
+                process_bucket::<L>(&evs, &cls, ctx, &mut po.sc, &mut po.rows, &mut po.camp);
+            }
+            ev.into_iter().for_each(BlockVec::release);
+            cl.into_iter().for_each(BlockVec::release);
+        },
+    );
+    pouts
+}
+
 fn main() {
     let t0 = Instant::now();
     if let Some(dir) = std::env::var_os("PROBE_MICRO") {
         probe_micro(Path::new(&dir));
+        return;
+    }
+    if std::env::var_os("PROBE_SCALE").is_some() {
+        probe_scale();
         return;
     }
     if std::env::var_os("NOHUGE").is_some() {
@@ -407,6 +572,7 @@ fn main() {
     let ctx = Ctx {
         ws,
         we,
+        ws_s: ws.div_euclid(1000),
         link,
         products,
         unknown_cat,
@@ -424,7 +590,6 @@ fn main() {
     let ev_chunks = ev_in.chunks();
     let cl_chunks = cl_in.chunks();
     let ev_bytes = ev_in.bytes();
-    let cl_bytes = cl_in.bytes();
     // ~20M events (1.7 GB) -> 512 / 1024 buckets; ~60M -> 1024 / 2048
     if ev_bytes > (3usize << 30) {
         EV_BITS.store(10, AO::Relaxed);
@@ -439,81 +604,14 @@ fn main() {
     let nev_b = 1usize << EV_BITS.load(AO::Relaxed);
     let np_b = 1usize << P_BITS.load(AO::Relaxed);
 
-    let parsed: Vec<Parsed> = if std::env::var_os("STAGE4").is_some() {
-        run_parse::<4>(nthreads, &ev_in, &cl_in, &ev_chunks, &cl_chunks, &ctx, nev_b, np_b)
+    // 24-byte payload records unless the window or the category count is too wide
+    let narrow = we - ws < u32::MAX as i64 && ctx.cat_names.len() <= 256 && std::env::var_os("WIDE").is_none();
+    let pouts = if narrow {
+        events_to_persons::<Narrow>(nthreads, t0, &ev_in, &cl_in, &ev_chunks, &cl_chunks, &ctx, nev_b, np_b)
     } else {
-        run_parse::<SK>(nthreads, &ev_in, &cl_in, &ev_chunks, &cl_chunks, &ctx, nev_b, np_b)
+        events_to_persons::<Wide>(nthreads, t0, &ev_in, &cl_in, &ev_chunks, &cl_chunks, &ctx, nev_b, np_b)
     };
-    // dedup keys go bucket-major (each dedup task takes its bucket and hands
-    // the blocks back); payloads stay per worker until dedup has marked losers
-    let ev_b: Vec<Mutex<Vec<BlockVec<DKey>>>> = (0..nev_b).map(|_| Mutex::new(Vec::new())).collect();
-    let cl_b: Vec<Mutex<Vec<BlockVec<ClRec>>>> = (0..np_b).map(|_| Mutex::new(Vec::new())).collect();
-    let mut pay: Vec<Vec<BlockVec<EvOut>>> = Vec::with_capacity(parsed.len());
-    let (mut nrec, mut ncl) = (0usize, 0usize);
-    for p in parsed {
-        for (b, v) in p.evk.into_iter().enumerate() {
-            nrec += v.len();
-            ev_b[b].lock().unwrap().push(v);
-        }
-        pay.push(p.evp);
-        for (b, v) in p.cl.into_iter().enumerate() {
-            ncl += v.len();
-            cl_b[b].lock().unwrap().push(v);
-        }
-    }
-    log(t0, &format!("parsed: {} event rows, {} valid clicks ({} + {} bytes)", nrec, ncl, ev_bytes, cl_bytes));
-
-    // ---- dedup: mark every copy but the earliest as dead, in place ----
-    let killed: usize = par_for(
-        nthreads,
-        nev_b,
-        || (0usize, Vec::<u64>::new(), Vec::<u64>::new()),
-        |(k, table, losers), b| {
-            let ks = std::mem::take(&mut *ev_b[b].lock().unwrap());
-            *k += dedup_bucket(&ks, &pay, table, losers);
-            ks.into_iter().for_each(BlockVec::release);
-        },
-    )
-    .into_iter()
-    .map(|x| x.0)
-    .sum();
-    let pe_b: Vec<Mutex<Vec<BlockVec<EvOut>>>> = (0..np_b).map(|_| Mutex::new(Vec::new())).collect();
-    let mut nsurv = 0usize;
-    for w in pay {
-        for (b, v) in w.into_iter().enumerate() {
-            nsurv += v.len();
-            pe_b[b].lock().unwrap().push(v);
-        }
-    }
-    log(t0, &format!("dedup: {} valid rows, {} later copies dropped", nsurv, killed));
-
-    // ---- per person ----
-    struct POut {
-        rows: Vec<URow>,
-        camp: Vec<[i64; 4]>,
-        sc: Scratch,
-    }
     let ncamp_tot = ctx.ncamp() + 1;
-    let pouts = par_for(
-        nthreads,
-        np_b,
-        || POut {
-            rows: Vec::new(),
-            camp: vec![[0i64; 4]; ncamp_tot * ndays],
-            sc: Scratch::new(ctx.cat_names.len()),
-        },
-        |po, b| {
-            let ev = std::mem::take(&mut *pe_b[b].lock().unwrap());
-            let cl = std::mem::take(&mut *cl_b[b].lock().unwrap());
-            {
-                let evs: Vec<&[EvOut]> = ev.iter().flat_map(|v| v.slices()).collect();
-                let cls: Vec<&[ClRec]> = cl.iter().flat_map(|v| v.slices()).collect();
-                process_bucket(&evs, &cls, &ctx, &mut po.sc, &mut po.rows, &mut po.camp);
-            }
-            ev.into_iter().for_each(BlockVec::release);
-            cl.into_iter().for_each(BlockVec::release);
-        },
-    );
     let nrows: usize = pouts.iter().map(|p| p.rows.len()).sum();
     log(t0, &format!("sessions done: {} user_daily rows", nrows));
 
@@ -690,16 +788,16 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
 
 /// lists: per worker, (pairs, keys per shard)
 /// One parse worker's finished output, ordered by worker id.
-struct Parsed {
+struct Parsed<L: Layout> {
     evk: Vec<BlockVec<DKey>>,
-    evp: Vec<BlockVec<EvOut>>,
+    evp: Vec<BlockVec<L::Ev>>,
     cl: Vec<BlockVec<ClRec>>,
 }
 
 /// Parses all event and click chunks on nthreads workers. K = records staged
 /// per bucket before each write-combined flush.
 #[allow(clippy::too_many_arguments)]
-fn run_parse<const K: usize>(
+fn run_parse<L: Layout, const K: usize>(
     nthreads: usize,
     ev_in: &Input,
     cl_in: &Input,
@@ -708,11 +806,11 @@ fn run_parse<const K: usize>(
     ctx: &Ctx,
     nev_b: usize,
     np_b: usize,
-) -> Vec<Parsed> {
-    struct ParseOut<const K: usize> {
+) -> Vec<Parsed<L>> {
+    struct ParseOut<L: Layout, const K: usize> {
         id: usize,
         evk: Parts<DKey, K>,
-        evp: Parts<EvOut, K>,
+        evp: Parts<L::Ev, K>,
         cl: Parts<ClRec, 4>,
         buf: Vec<u8>,
     }
@@ -720,7 +818,7 @@ fn run_parse<const K: usize>(
     let mut outs = par_for(
         nthreads,
         ev_chunks.len() + cl_chunks.len(),
-        || ParseOut::<K> {
+        || ParseOut::<L, K> {
             id: next_id.fetch_add(1, AO::Relaxed),
             evk: Parts::new(nev_b),
             evp: Parts::new(np_b),
@@ -732,14 +830,14 @@ fn run_parse<const K: usize>(
             if i < ev_chunks.len() {
                 let (fi, s0, e0) = ev_chunks[i];
                 if *MMAPIO {
-                    parse_events(ev_in.maps[fi].bytes(), s0, e0, ctx, po.id, &mut po.evk, &mut po.evp);
+                    parse_events::<L, K>(ev_in.maps[fi].bytes(), s0, e0, ctx, po.id, &mut po.evk, &mut po.evp);
                     return;
                 }
                 let mut p = s0;
                 while p < e0 {
                     let q = (p + *PIECE_SZ).min(e0);
                     let (s, e) = ev_in.read(fi, p, q, &mut po.buf);
-                    parse_events(&po.buf, s, e, ctx, po.id, &mut po.evk, &mut po.evp);
+                    parse_events::<L, K>(&po.buf, s, e, ctx, po.id, &mut po.evk, &mut po.evp);
                     p = q;
                 }
             } else {
@@ -814,6 +912,83 @@ fn probe_hooks(nthreads: usize, cd: &Path) {
 
 /// Diagnostics only: micro-benchmarks of the machine primitives the pipeline
 /// leans on, appended as one line to PROBE_OUT.
+/// Diagnostics only: how throughput scales with threads on this machine
+/// (integer work and memory reads), appended as one line to PROBE_OUT.
+fn probe_scale() {
+    let mut out = String::from("S");
+    for nt in [1usize, 2, 4, 8] {
+        let t = Instant::now();
+        let iters = 200_000_000u64;
+        let sum: u64 = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..nt)
+                .map(|k| {
+                    sc.spawn(move || {
+                        let (mut a, mut b, mut c, mut d) = (k as u64 + 1, 2u64, 3u64, 4u64);
+                        for _ in 0..iters / 4 {
+                            a ^= a << 13;
+                            a ^= a >> 7;
+                            b = b.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(a);
+                            c ^= c << 17;
+                            c ^= c >> 5;
+                            d = d.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).wrapping_add(c);
+                        }
+                        std::hint::black_box(a ^ b ^ c ^ d)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        std::hint::black_box(sum);
+        // aggregate iterations per nanosecond
+        out += &format!(" alu{}={:.2}", nt, (nt as u64 * iters) as f64 / t.elapsed().as_nanos() as f64);
+    }
+    let per = 256usize << 20;
+    let bufs: Vec<Vec<u64>> = (0..8).map(|_| vec![1u64; per / 8]).collect();
+    for nt in [1usize, 2, 4, 8] {
+        let t = Instant::now();
+        std::thread::scope(|sc| {
+            for b in bufs.iter().take(nt) {
+                sc.spawn(move || {
+                    let mut s = 0u64;
+                    for _ in 0..2 {
+                        for x in b.iter() {
+                            s = s.wrapping_add(*x);
+                        }
+                    }
+                    std::hint::black_box(s);
+                });
+            }
+        });
+        out += &format!(" bw{}={:.1}", nt, (nt * per * 2) as f64 / t.elapsed().as_nanos() as f64);
+    }
+    let cpus = std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find(|l| l.starts_with("Cpus_allowed_list"))
+        .map(|l| l.split_whitespace().last().unwrap_or("").to_string())
+        .unwrap_or_default();
+    out += &format!(" cpus={}", cpus);
+    // physical core of each allowed CPU (HT siblings share one)
+    let mut ids = Vec::new();
+    for part in cpus.split(',') {
+        let mut it = part.split('-').filter_map(|x| x.parse::<usize>().ok());
+        if let Some(a) = it.next() {
+            let b = it.next().unwrap_or(a);
+            for c in a..=b {
+                let core = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{}/topology/core_id", c)).unwrap_or_default();
+                ids.push(core.trim().to_string());
+            }
+        }
+    }
+    out += &format!(" core={}", ids.join("."));
+    if let Some(path) = std::env::var_os("PROBE_OUT") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", out);
+        }
+    }
+}
+
 fn probe_micro(dir: &Path) {
     let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
     let mut out = String::from("M");
@@ -1090,38 +1265,39 @@ struct PendEv {
     ekey: u128,
     ukey: u128,
     ts: i64,
-    ingest: i64,
     hu: u64,
+    ing: u32,
     price: u32,
     b: u16,
     cat: u16,
-    kind: u8,
 }
 
 #[inline(always)]
-fn finish_ev<const K: usize>(ctx: &Ctx, wid: usize, p: &PendEv, outk: &mut Parts<DKey, K>, outp: &mut Parts<EvOut, K>) {
+fn finish_ev<L: Layout, const K: usize>(ctx: &Ctx, wid: usize, p: &PendEv, outk: &mut Parts<DKey, K>, outp: &mut Parts<L::Ev, K>) {
     let (pkey, ph) = match ctx.link.get_h(p.ukey, p.hu) {
         Some(n) => (n, p_hash(n)),
         None => (p.ukey, p.hu),
     };
     let pb = (ph >> (64 - P_BITS.load(AO::Relaxed))) as usize;
-    let i = outp.push_idx(pb, EvOut { pkey, ts: p.ts, price: p.price, cat: p.cat, kind: p.kind });
+    let i = outp.push_idx(pb, L::ev(pkey, (p.ts - ctx.ws) as u64, p.price, p.cat));
+    assert!(i < LOC_IDX, "too many events per bucket");
     let loc = mkloc(wid, pb, i);
-    outk.push(p.b as usize, DKey { k0: p.ekey as u64, k1: (p.ekey >> 64) as u64, ingest: p.ingest, loc });
+    outk.push(p.b as usize, DKey { k0: p.ekey as u64, k1: (p.ekey >> 64) as u64, x: ((p.ing as u64) << 37) | loc });
 }
 
-fn parse_events<const K: usize>(d: &[u8], s: usize, e: usize, ctx: &Ctx, wid: usize, outk: &mut Parts<DKey, K>, outp: &mut Parts<EvOut, K>) {
+fn parse_events<L: Layout, const K: usize>(d: &[u8], s: usize, e: usize, ctx: &Ctx, wid: usize, outk: &mut Parts<DKey, K>, outp: &mut Parts<L::Ev, K>) {
     let end = d.as_ptr_range().end;
     let mut ring = [PendEv::default(); RING];
     let mut cnt = 0usize;
-    let finish = |p: &PendEv, outk: &mut Parts<DKey, K>, outp: &mut Parts<EvOut, K>| finish_ev(ctx, wid, p, outk, outp);
+    let finish = |p: &PendEv, outk: &mut Parts<DKey, K>, outp: &mut Parts<L::Ev, K>| finish_ev::<L, K>(ctx, wid, p, outk, outp);
     for_rows::<7>(d, s, e, #[inline(always)] |f| {
         let [eid, uid, ts, ing, et, pid, price] = *f;
         if eid.is_empty() {
             return;
         }
         let ekey = key_fast(eid, end);
-        let ingest = parse_ts_fast(ing, end).unwrap_or(i64::MAX);
+        let ingest = parse_ingest_secs(ing, end);
+        let icode = ingest_code(ingest, ctx.ws_s) as u32;
         'v: {
             if uid.is_empty() || pid.is_empty() {
                 break 'v;
@@ -1130,25 +1306,23 @@ fn parse_events<const K: usize>(d: &[u8], s: usize, e: usize, ctx: &Ctx, wid: us
                 Some(t) if t >= ctx.ws && t < ctx.we => t,
                 _ => break 'v,
             };
-            let kind = match et.len() {
-                4 => match u32::from_le_bytes(et.try_into().unwrap()) {
-                    0x7765_6976 => K_VIEW, // "view"
-                    0x7472_6163 => K_CART, // "cart"
-                    _ => break 'v,
-                },
-                8 if u64::from_le_bytes(et.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") => K_PURCHASE,
-                _ => break 'v,
-            };
             let mut pr = 0;
             let mut cat = 0;
-            if kind == K_PURCHASE {
-                pr = match parse_price(price) {
-                    Some(p) => p,
-                    None => break 'v,
-                };
-                cat = ctx.products.get(key_fast(pid, end)).unwrap_or(ctx.unknown_cat);
+            match et.len() {
+                4 => match u32::from_le_bytes(et.try_into().unwrap()) {
+                    0x7765_6976 | 0x7472_6163 => {} // "view", "cart"
+                    _ => break 'v,
+                },
+                8 if u64::from_le_bytes(et.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") => {
+                    pr = match parse_price(price) {
+                        Some(p) => p,
+                        None => break 'v,
+                    };
+                    cat = ctx.products.get(key_fast(pid, end)).unwrap_or(ctx.unknown_cat);
+                }
+                _ => break 'v,
             }
-            if ingest.saturating_sub(t) > DAY_MS {
+            if ingest.map_or(i64::MAX, |x| x * 1000).saturating_sub(t) > DAY_MS {
                 break 'v;
             }
             let ukey = key_fast(uid, end);
@@ -1159,12 +1333,12 @@ fn parse_events<const K: usize>(d: &[u8], s: usize, e: usize, ctx: &Ctx, wid: us
                 finish(&ring[slot], outk, outp);
             }
             let b = ev_bucket(hash128(ekey)) as u16;
-            ring[slot] = PendEv { ekey, ukey, ts: t, ingest, hu, price: pr, b, cat, kind };
+            ring[slot] = PendEv { ekey, ukey, ts: t, hu, ing: icode, price: pr, b, cat };
             cnt += 1;
             return;
         }
         let b = ev_bucket(hash128(ekey));
-        outk.push(b, DKey { k0: ekey as u64, k1: (ekey >> 64) as u64, ingest, loc: NOLOC });
+        outk.push(b, DKey { k0: ekey as u64, k1: (ekey >> 64) as u64, x: ((icode as u64) << 37) | NOLOC });
     });
     let start = cnt.saturating_sub(RING);
     for i in start..cnt {
@@ -1227,7 +1401,7 @@ fn parse_clicks(d: &[u8], s: usize, e: usize, ctx: &Ctx, out: &mut Parts<ClRec, 
 
 /// Finds, per event_id, the copy with the smallest ingest_ts and marks the
 /// payloads of all other copies dead. Returns how many payloads it killed.
-fn dedup_bucket(kparts: &[BlockVec<DKey>], pay: &[Vec<BlockVec<EvOut>>], table: &mut Vec<u64>, losers: &mut Vec<u64>) -> usize {
+fn dedup_bucket<T: Copy>(kparts: &[BlockVec<DKey>], pay: &[Vec<BlockVec<T>>], table: &mut Vec<u64>, losers: &mut Vec<u64>) -> usize {
     let n: usize = kparts.iter().map(|p| p.len()).sum();
     if n == 0 {
         return 0;
@@ -1270,7 +1444,7 @@ fn dedup_bucket(kparts: &[BlockVec<DKey>], pay: &[Vec<BlockVec<EvOut>>], table: 
                         let o = get(cg);
                         if o.ekey() == ek {
                             any = true;
-                            if rec.ingest < o.ingest {
+                            if rec.ing() < o.ing() {
                                 table[s] = (g as u64) | ((fp as u64) << 32);
                                 losers[cg / 64] |= 1 << (cg % 64);
                             } else {
@@ -1294,14 +1468,15 @@ fn dedup_bucket(kparts: &[BlockVec<DKey>], pay: &[Vec<BlockVec<EvOut>>], table: 
         while bits != 0 {
             let g = w * 64 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            let loc = get(g).loc;
+            let loc = get(g).loc();
             if loc != NOLOC {
-                let t = (loc >> 59) as usize;
-                let pb = ((loc >> 40) & ((1 << 19) - 1)) as usize;
-                let i = (loc & ((1 << 40) - 1)) as usize;
-                let p = pay[t][pb].ptr(i);
-                // distinct rows only, each marked once; read after the phase joins
-                unsafe { std::sync::atomic::AtomicU8::from_ptr(std::ptr::addr_of_mut!((*p).kind)).store(K_INVALID, AO::Relaxed) };
+                let t = (loc >> 32) as usize;
+                let pb = ((loc >> 20) & ((1 << 12) - 1)) as usize;
+                let i = (loc & ((1 << 20) - 1)) as usize;
+                let p = pay[t][pb].ptr(i) as *mut u64;
+                // word 2 := MAX marks the record dead; distinct rows only, each
+                // marked once; read after the phase joins
+                unsafe { std::sync::atomic::AtomicU64::from_ptr(p.add(2)).store(u64::MAX, AO::Relaxed) };
                 killed += 1;
             }
         }
@@ -1328,35 +1503,31 @@ struct Scratch {
     sorted64: Vec<u64>,
     sorted128: Vec<u128>,
     radix: Vec<u64>,
-    purch: Vec<(u32, u16)>, // (price, category) of purchases, payload = index + 1
     cls: Vec<ClRec>,
     pos: Vec<u32>,
     pratio: f64, // persons per event row in the last bucket (sizes the next table)
 }
 
-/// An event inside the person phase: time offset from window_start, then a
-/// payload (0, or 1 + index of the purchase in Scratch::purch). Ordering is by
-/// time first; the order of equal times does not matter.
-trait EKey: Copy + Ord + Send {
-    fn make(off: u64, payload: u32) -> Self;
+/// An event inside the person phase: time offset from window_start, then the
+/// purchase (price, category) or 0. Ordering is by time first; the order of
+/// equal times does not matter.
+trait EKey: Copy + Ord + Send + Sync + 'static {
     fn off(self) -> i64;
-    fn payload(self) -> u32;
+    /// (price, category); price 0 = not a purchase
+    fn purchase(self) -> (u32, u16);
     fn vecs(sc: &mut Scratch) -> (&mut Vec<Self>, &mut Vec<Self>);
     fn sort(v: &mut [Self], tmp: &mut Vec<u64>);
 }
 
 impl EKey for u64 {
     #[inline(always)]
-    fn make(off: u64, payload: u32) -> Self {
-        (off << 32) | payload as u64
-    }
-    #[inline(always)]
     fn off(self) -> i64 {
         (self >> 32) as i64
     }
     #[inline(always)]
-    fn payload(self) -> u32 {
-        self as u32
+    fn purchase(self) -> (u32, u16) {
+        let p = self as u32;
+        (p >> 8, (p & 0xFF) as u16)
     }
     fn vecs(sc: &mut Scratch) -> (&mut Vec<Self>, &mut Vec<Self>) {
         (&mut sc.ek64, &mut sc.sorted64)
@@ -1373,16 +1544,13 @@ impl EKey for u64 {
 
 impl EKey for u128 {
     #[inline(always)]
-    fn make(off: u64, payload: u32) -> Self {
-        ((off as u128) << 32) | payload as u128
-    }
-    #[inline(always)]
     fn off(self) -> i64 {
-        (self >> 32) as i64
+        (self >> 64) as i64
     }
     #[inline(always)]
-    fn payload(self) -> u32 {
-        self as u32
+    fn purchase(self) -> (u32, u16) {
+        let p = self as u64;
+        ((p >> 16) as u32, p as u16)
     }
     fn vecs(sc: &mut Scratch) -> (&mut Vec<Self>, &mut Vec<Self>) {
         (&mut sc.ek128, &mut sc.sorted128)
@@ -1444,7 +1612,6 @@ impl Scratch {
             sorted64: vec![],
             sorted128: vec![],
             radix: vec![],
-            purch: vec![],
             cls: vec![],
             pos: vec![],
             pratio: 0.0625,
@@ -1454,24 +1621,8 @@ impl Scratch {
 
 /// Groups the bucket's events and clicks by person (hash + counting sort),
 /// sorts each person's rows by time, and processes them.
-fn process_bucket(
-    evsrc: &[&[EvOut]],
-    clsrc: &[&[ClRec]],
-    ctx: &Ctx,
-    sc: &mut Scratch,
-    rows: &mut Vec<URow>,
-    camp: &mut [[i64; 4]],
-) {
-    // event times as 32-bit offsets when the window allows (it nearly always does)
-    if ctx.we - ctx.ws <= u32::MAX as i64 {
-        process_bucket_k::<u64>(evsrc, clsrc, ctx, sc, rows, camp)
-    } else {
-        process_bucket_k::<u128>(evsrc, clsrc, ctx, sc, rows, camp)
-    }
-}
-
-fn process_bucket_k<K: EKey>(
-    evsrc: &[&[EvOut]],
+fn process_bucket<L: Layout>(
+    evsrc: &[&[L::Ev]],
     clsrc: &[&[ClRec]],
     ctx: &Ctx,
     sc: &mut Scratch,
@@ -1482,12 +1633,11 @@ fn process_bucket_k<K: EKey>(
     if n == 0 {
         return;
     }
-    let ws = ctx.ws;
     // ---- events: person ids via a local hash table, counted as we go; each
-    // live event becomes a compact key (time offset, purchase payload) ----
+    // live event's key (time offset, purchase) is collected alongside ----
     let mut cap = (((n as f64 * sc.pratio * 2.0) as usize + 1).max(64)).next_power_of_two();
     let (mut ekeys, mut sorted) = {
-        let (a, b) = K::vecs(sc);
+        let (a, b) = L::K::vecs(sc);
         (std::mem::take(a), std::mem::take(b))
     };
     'retry: loop {
@@ -1498,14 +1648,13 @@ fn process_bucket_k<K: EKey>(
         sc.pid.clear();
         sc.eoff.clear();
         sc.eoff.push(0);
-        sc.purch.clear();
         ekeys.clear();
         for sl in evsrc {
             for e in sl.iter() {
-                if e.kind == K_INVALID {
+                if L::dead(e) {
                     continue;
                 }
-                let k = e.pkey;
+                let k = L::pkey(e);
                 let mut i = (p_hash(k) as usize) & mask;
                 let id = loop {
                     let s = unsafe { sc.table.get_unchecked_mut(i) };
@@ -1527,13 +1676,7 @@ fn process_bucket_k<K: EKey>(
                 };
                 unsafe { *sc.eoff.get_unchecked_mut(id as usize + 1) += 1 };
                 sc.pid.push(id);
-                let payload = if e.kind == K_PURCHASE {
-                    sc.purch.push((e.price, e.cat));
-                    sc.purch.len() as u32
-                } else {
-                    0
-                };
-                ekeys.push(K::make((e.ts - ws) as u64, payload));
+                ekeys.push(L::key(e));
             }
         }
         break;
@@ -1617,7 +1760,7 @@ fn process_bucket_k<K: EKey>(
         let (ca, cb) = (sc.coff[id] as usize, sc.coff[id + 1] as usize);
         let pe = &mut sorted[ea..eb];
         if pe.len() > 1 {
-            K::sort(pe, &mut sc.radix);
+            L::K::sort(pe, &mut sc.radix);
         }
         let pc = &mut cls_s[ca..cb];
         if pc.len() > 1 {
@@ -1641,7 +1784,7 @@ fn process_bucket_k<K: EKey>(
         process_person(pk, &sorted[ea..eb], &cls_s[ca..cb], ctx, sc, rows, camp);
     }
     sc.cls = cls_s;
-    let (a, b) = K::vecs(sc);
+    let (a, b) = L::K::vecs(sc);
     *a = ekeys;
     *b = sorted;
 }
@@ -1712,9 +1855,8 @@ fn process_person<K: EKey>(p: u128, evs: &[K], cls: &[ClRec], ctx: &Ctx, sc: &mu
             let e = evs[k];
             last = e.off();
             cnt += 1;
-            let pl = e.payload();
-            if pl != 0 {
-                let (price, cat) = unsafe { *sc.purch.get_unchecked(pl as usize - 1) };
+            let (price, cat) = e.purchase();
+            if price != 0 {
                 rev += price as i64;
                 purch = true;
                 let c = cat as usize;
