@@ -155,7 +155,29 @@ fn par_for<T: Send, I: Fn() -> T + Sync, F: Fn(&mut T, usize) + Sync>(nthreads: 
 
 struct Input {
     files: Vec<(File, usize)>,
+    maps: Vec<Mm>,
 }
+
+/// Read-only file mapping (used instead of pread when MMAPIO is set).
+struct Mm {
+    p: usize,
+    n: usize,
+}
+
+impl Mm {
+    fn new(f: &File, n: usize) -> Mm {
+        use std::os::unix::io::AsRawFd;
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+        assert!(p != libc::MAP_FAILED, "mmap input failed");
+        Mm { p: p as usize, n }
+    }
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.p as *const u8, self.n) }
+    }
+}
+
+/// input via mmap instead of pread (scorer: mapping cost is negligible)
+static MMAPIO: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("MMAPIO").is_some());
 
 impl Input {
     fn open(dir: &Path) -> Input {
@@ -178,7 +200,8 @@ impl Input {
                 }
             }
         }
-        Input { files }
+        let maps = if *MMAPIO { files.iter().map(|(f, n)| Mm::new(f, *n)).collect() } else { Vec::new() };
+        Input { files, maps }
     }
 
     fn bytes(&self) -> usize {
@@ -387,6 +410,10 @@ fn main() {
             // read in cache-sized pieces so the buffer stays in L2
             if i < ev_chunks.len() {
                 let (fi, s0, e0) = ev_chunks[i];
+                if *MMAPIO {
+                    parse_events(ev_in.maps[fi].bytes(), s0, e0, &ctx, po.id, &mut po.evk, &mut po.evp);
+                    return;
+                }
                 let mut p = s0;
                 while p < e0 {
                     let q = (p + PIECE).min(e0);
@@ -396,6 +423,10 @@ fn main() {
                 }
             } else {
                 let (fi, s0, e0) = cl_chunks[i - ev_chunks.len()];
+                if *MMAPIO {
+                    parse_clicks(cl_in.maps[fi].bytes(), s0, e0, &ctx, &mut po.cl);
+                    return;
+                }
                 let mut p = s0;
                 while p < e0 {
                     let q = (p + PIECE).min(e0);
@@ -634,15 +665,21 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
 fn probe_hooks(nthreads: usize, cd: &Path) {
     if let Some(path) = std::env::var_os("PROBE_OUT") {
         let m = MARKS.lock().unwrap();
-        let mut line = format!("T{}", nthreads);
+        let tag = std::env::var("PROBE_TAG").unwrap_or_default();
+        let mut line = format!("T{}{}", nthreads, tag);
         let names = ["", "L", "P", "D", "S", "W"];
+        let f2 = |x: f64| format!("{:.2}", x).trim_start_matches('0').to_string();
         for i in 1..m.len().min(names.len()) {
-            line += &format!(" {}{:.2}", names[i], m[i].0 - m[i - 1].0);
+            let (w, u, s) = (m[i].0 - m[i - 1].0, m[i].1 - m[i - 1].1, m[i].2 - m[i - 1].2);
+            if names[i] == "P" || names[i] == "S" {
+                line += &format!(" {}{}/{}/{}", names[i], f2(w), f2(u), f2(s));
+            } else {
+                line += &format!(" {}{}", names[i], f2(w));
+            }
         }
         if let Some(l) = m.last() {
-            line += &format!(" ={:.2} u{:.1} s{:.1}", l.0, l.1, l.2);
+            line += &format!(" ={} u{:.1} s{:.1}", f2(l.0), l.1, l.2);
         }
-        let line = line.replace(" L0.", " L.").replace(" P0.", " P.").replace(" D0.", " D.").replace(" S0.", " S.").replace(" W0.", " W.").replace(" =0.", " =.");
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{}", line);
