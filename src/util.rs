@@ -43,12 +43,22 @@ pub fn key_fast(b: &[u8], end: *const u8) -> u128 {
     let n = b.len();
     if n <= 15 && n > 0 && b.as_ptr().wrapping_add(16) <= end {
         let v = u128::from_be_bytes(unsafe { std::ptr::read_unaligned(b.as_ptr() as *const [u8; 16]) });
-        let mask = !0u128 << (8 * (16 - n));
-        (v & mask) | n as u128
+        (v & KEYMASK[n]) | n as u128
     } else {
         key_of(b)
     }
 }
+
+/// KEYMASK[n] keeps the top n bytes of a big-endian u128
+static KEYMASK: [u128; 16] = {
+    let mut t = [0u128; 16];
+    let mut n = 1;
+    while n < 16 {
+        t[n] = !0u128 << (8 * (16 - n));
+        n += 1;
+    }
+    t
+};
 
 #[cold]
 fn long_key(b: &[u8]) -> u128 {
@@ -96,16 +106,14 @@ pub fn cmp_key(a: u128, b: u128) -> Ordering {
     }
 }
 
+/// Cheap 128 -> 64 bit hash: good top bits (bucket choice) and, after the
+/// final fold, good low bits (table slots).
 #[inline(always)]
 pub fn hash128(k: u128) -> u64 {
     let lo = k as u64;
     let hi = (k >> 64) as u64;
-    let m = ((lo ^ 0x243F_6A88_85A3_08D3) as u128).wrapping_mul((hi ^ 0x1319_8A2E_0370_7344) as u128);
-    let mut x = (m as u64) ^ ((m >> 64) as u64) ^ lo.rotate_left(17);
-    x ^= x >> 32;
-    x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x ^= x >> 29;
-    x
+    let m = lo.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ hi.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    m ^ (m >> 29) ^ (m >> 47)
 }
 
 // ---------------------------------------------------------------------------
@@ -127,30 +135,6 @@ impl<V: Copy + Default> KeyMap<V> {
     #[inline(always)]
     pub fn get(&self, k: u128) -> Option<V> {
         let mut i = (hash128(k) as usize) & self.mask;
-        loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            if s.0 == k {
-                return Some(s.1);
-            }
-            if s.0 == 0 {
-                return None;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-
-    #[inline(always)]
-    pub fn prefetch(&self, h: u64) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let p = self.slots.as_ptr().add((h as usize) & self.mask) as *const i8;
-            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
-        }
-    }
-
-    #[inline(always)]
-    pub fn get_h(&self, k: u128, h: u64) -> Option<V> {
-        let mut i = (h as usize) & self.mask;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
             if s.0 == k {
@@ -200,9 +184,6 @@ impl<V: Copy + Default> KeyMap<V> {
         }
     }
 
-    pub fn slots_mut(&mut self) -> &mut [(u128, V)] {
-        &mut self.slots
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +239,7 @@ pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> boo
 /// Calls f on every line whose first byte lies in [s, e). The first line of
 /// the file (the header) is skipped.
 #[inline]
-pub fn for_lines(data: &[u8], s: usize, e: usize, mut f: impl FnMut(&[u8])) {
+pub fn for_lines<'a>(data: &'a [u8], s: usize, e: usize, mut f: impl FnMut(&'a [u8])) {
     let mut pos = if s == 0 {
         match memchr::memchr(b'\n', data) {
             Some(i) => i + 1,
@@ -508,6 +489,66 @@ mod tests {
         }
     }
 
+    fn rows_struct_case<const N: usize>(x: &mut u64) {
+        let mut data = b"h\n".to_vec();
+        let mut lines = Vec::new();
+        for _ in 0..3000 {
+            let mut l = Vec::new();
+            *x ^= *x << 13; *x ^= *x >> 7; *x ^= *x << 17;
+            let mut y = *x;
+            let mut rnd = |m: u64| {
+                y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (y >> 33) % m
+            };
+            let nf = if rnd(10) == 0 { N - 1 + rnd(3) as usize } else { N };
+            for f in 0..nf {
+                if f > 0 {
+                    l.push(b',');
+                }
+                let lim = if rnd(4) == 0 { 40 } else { 14 };
+                let flen = rnd(lim) as usize;
+                let quoted = rnd(3) == 0;
+                if quoted {
+                    l.push(b'"');
+                }
+                for _ in 0..flen {
+                    l.push(b"abcdefxyz019-:"[rnd(14) as usize]);
+                }
+                if quoted && rnd(25) != 0 {
+                    l.push(b'"');
+                }
+                if rnd(60) == 0 {
+                    l.push(b"\",\r"[rnd(3) as usize]);
+                }
+            }
+            data.extend_from_slice(&l);
+            data.push(b'\n');
+            lines.push(l);
+        }
+        let len = data.len();
+        data.extend_from_slice(&[0u8; 256]);
+        let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+        for_rows::<N>(&data, 0, len, |f| got.push(f.iter().map(|v| v.to_vec()).collect()));
+        let mut want: Vec<Vec<Vec<u8>>> = Vec::new();
+        for l in &lines {
+            let mut o: [&[u8]; N] = [b""; N];
+            if split(l, &mut o) {
+                want.push(o.iter().map(|v| v.to_vec()).collect());
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn rows_match_split_structured() {
+        let mut x = 0x9E3779B97F4A7C15u64;
+        for _ in 0..200 {
+            rows_struct_case::<7>(&mut x);
+            rows_struct_case::<4>(&mut x);
+            rows_struct_case::<2>(&mut x);
+        }
+    }
+
     #[test]
     fn ts_fast_matches() {
         let cases: Vec<&[u8]> = vec![
@@ -554,6 +595,32 @@ mod tests {
             let end = v.as_ptr_range().end;
             assert_eq!(parse_ts_fast(&v[..m], end), parse_ts(&v[..m]), "{:?}", String::from_utf8_lossy(&v[..m]));
         }
+        // random field values (in and out of range) with random trailing bytes
+        for _ in 0..400000 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let r = |k: u32, m: u64| (x >> k) % m;
+            let y = match r(0, 4) { 0 => r(3, 10000), 1 => 1890 + r(5, 30), 2 => 2290 + r(7, 20), _ => 2020 + r(9, 10) };
+            let sep = if r(40, 2) == 0 { b'+' } else { b'-' };
+            let mut v = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                y, r(12, 14), r(16, 33), r(22, 26), r(27, 62), r(33, 62)
+            )
+            .into_bytes();
+            if r(39, 2) == 0 {
+                v.push(b'Z');
+            } else {
+                v.push(sep);
+                v.extend_from_slice(format!("{:02}:{:02}", r(41, 26), r(46, 62)).as_bytes());
+            }
+            let m = v.len();
+            let mut z = x;
+            for _ in 0..32 {
+                z ^= z << 13; z ^= z >> 7; z ^= z << 17;
+                v.push(z as u8);
+            }
+            let end = v.as_ptr_range().end;
+            assert_eq!(parse_ts_fast(&v[..m], end), parse_ts(&v[..m]), "{:?}", String::from_utf8_lossy(&v[..m]));
+        }
     }
 
     #[test]
@@ -590,54 +657,104 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Fast row iterator: 128-byte SIMD window per line, scalar fallback.
+// Fast row iterator: SIMD masks of a 64- or 128-byte window per line, scalar
+// fallback for longer lines.
 // ---------------------------------------------------------------------------
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     unsafe {
         let nl = _mm256_set1_epi8(b'\n' as i8);
         let cm = _mm256_set1_epi8(b',' as i8);
         let qt = _mm256_set1_epi8(b'"' as i8);
-        let (mut n, mut c, mut q) = (0u128, 0u128, 0u128);
-        for k in 0..4 {
-            let v = _mm256_loadu_si256(p.add(32 * k) as *const __m256i);
-            n |= ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl)) as u32) as u128) << (32 * k);
-            c |= ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, cm)) as u32) as u128) << (32 * k);
-            q |= ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, qt)) as u32) as u128) << (32 * k);
-        }
-        (n, c, q)
+        let v0 = _mm256_loadu_si256(p as *const __m256i);
+        let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let m = |v: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64;
+        (m(v0, nl) | m(v1, nl) << 32, m(v0, cm) | m(v1, cm) << 32, m(v0, qt) | m(v1, qt) << 32)
     }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
-    let (mut n, mut c, mut q) = (0u128, 0u128, 0u128);
-    for i in 0..128 {
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    let (mut n, mut c, mut q) = (0u64, 0u64, 0u64);
+    for i in 0..64 {
         let b = unsafe { *p.add(i) };
-        n |= ((b == b'\n') as u128) << i;
-        c |= ((b == b',') as u128) << i;
-        q |= ((b == b'"') as u128) << i;
+        n |= ((b == b'\n') as u64) << i;
+        c |= ((b == b',') as u64) << i;
+        q |= ((b == b'"') as u64) << i;
     }
     (n, c, q)
-}
-
-#[inline(always)]
-fn below(x: usize) -> u128 {
-    (1u128 << x) - 1
 }
 
 /// Quoting is valid iff every quote sits at its field's first or last byte,
 /// the count is even, and no separator lies between an opening and a closing
 /// quote (prefix-XOR of the quote mask is 0 at every comma). Together these
 /// mean each field has 0 quotes, or exactly 2 at both ends (length >= 2).
+/// `lb` is the single bit at the line's newline.
 #[inline(always)]
-fn quotes_ok(q: u128, c: u128, ll: usize) -> bool {
+fn quotes_ok(q: u128, c: u128, lb: u128) -> bool {
     let starts = (c << 1) | 1;
-    let ends = (c >> 1) | (1u128 << (ll - 1));
+    let ends = (c >> 1) | (lb >> 1);
+    if q & !(starts | ends) != 0 {
+        return false;
+    }
+    let x = prefix_xor(q);
+    // bit 127 of the inclusive prefix-XOR is the parity of the whole mask
+    (x & c) == 0 && (x >> 127) == 0
+}
+
+/// quotes_ok for a line within 64 bytes.
+#[inline(always)]
+fn quotes_ok64(q: u64, c: u64, lb: u64) -> bool {
+    let starts = (c << 1) | 1;
+    let ends = (c >> 1) | (lb >> 1);
+    if q & !(starts | ends) != 0 {
+        return false;
+    }
+    let x = prefix_xor64(q);
+    (x & c) == 0 && (x >> 63) == 0
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+#[inline(always)]
+fn prefix_xor64(q: u64) -> u64 {
+    use std::arch::x86_64::*;
+    unsafe { _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q as i64), _mm_set1_epi8(-1), 0x00)) as u64 }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+#[inline(always)]
+fn prefix_xor64(q: u64) -> u64 {
+    let mut x = q;
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+#[inline(always)]
+fn prefix_xor(q: u128) -> u128 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm_set_epi64x((q >> 64) as i64, q as i64);
+        let ones = _mm_set1_epi8(-1);
+        let lo = _mm_cvtsi128_si64(_mm_clmulepi64_si128(v, ones, 0x00)) as u64;
+        let hi = _mm_cvtsi128_si64(_mm_clmulepi64_si128(v, ones, 0x01)) as u64;
+        let hi = hi ^ 0u64.wrapping_sub(lo >> 63);
+        (hi as u128) << 64 | lo as u128
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+#[inline(always)]
+fn prefix_xor(q: u128) -> u128 {
     let mut x = q;
     x ^= x << 1;
     x ^= x << 2;
@@ -646,13 +763,139 @@ fn quotes_ok(q: u128, c: u128, ll: usize) -> bool {
     x ^= x << 16;
     x ^= x << 32;
     x ^= x << 64;
-    (q & !(starts | ends)) == 0 && q.count_ones() % 2 == 0 && (x & c) == 0
+    x
 }
 
-/// Calls f with the N fields of every well-formed line whose first byte lies
-/// in [s, e). The file's first line (the header) is skipped.
+/// Position of the lowest set bit of hi:lo (which must be non-zero), cleared
+/// afterwards; branch-free so the 64-bit boundary costs no mispredicts.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub fn for_rows<'a, const N: usize>(data: &'a [u8], s: usize, e: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+fn next_bit(lo: &mut u64, hi: &mut u64) -> usize {
+    let t: u64;
+    unsafe {
+        std::arch::asm!(
+            "tzcnt {t}, {lo}",
+            "blsr {hn}, {hi}",
+            "tzcnt {th}, {hi}",
+            "add {th}, 64",
+            "test {lo}, {lo}",
+            "cmovz {t}, {th}",
+            "cmovz {hi}, {hn}",
+            "blsr {lo}, {lo}",
+            t = out(reg) t,
+            th = out(reg) _,
+            hn = out(reg) _,
+            lo = inout(reg) *lo,
+            hi = inout(reg) *hi,
+            options(pure, nomem, nostack),
+        );
+    }
+    t as usize
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn next_bit(lo: &mut u64, hi: &mut u64) -> usize {
+    if *lo != 0 {
+        let t = lo.trailing_zeros() as usize;
+        *lo &= *lo - 1;
+        t
+    } else {
+        let t = 64 + hi.trailing_zeros() as usize;
+        *hi &= hi.wrapping_sub(1);
+        t
+    }
+}
+
+/// One well-formed line of N fields, read in order: next() for fields
+/// 0..N-1, then last() for field N-1 (a line need not be read to the end).
+pub trait Fields<'a> {
+    fn next(&mut self) -> &'a [u8];
+    fn last(&mut self) -> &'a [u8];
+}
+
+/// Receives the fields of each well-formed line (see rows).
+pub trait RowSink<'a> {
+    fn row<R: Fields<'a>>(&mut self, r: &mut R);
+}
+
+/// a field [a, b) of the line at base, quotes removed (quoting already validated)
+#[inline(always)]
+fn strip<'a>(base: *const u8, a: usize, b: usize) -> &'a [u8] {
+    let isq = (unsafe { *base.add(a) } == b'"') as usize;
+    unsafe { std::slice::from_raw_parts(base.add(a + isq), b - a - 2 * isq) }
+}
+
+pub struct Row64<'a> {
+    base: *const u8,
+    c: u64,
+    a: usize,
+    ll: usize,
+    _m: std::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a> Fields<'a> for Row64<'a> {
+    #[inline(always)]
+    fn next(&mut self) -> &'a [u8] {
+        let b = self.c.trailing_zeros() as usize;
+        self.c &= self.c.wrapping_sub(1);
+        let f = strip(self.base, self.a, b);
+        self.a = b + 1;
+        f
+    }
+    #[inline(always)]
+    fn last(&mut self) -> &'a [u8] {
+        strip(self.base, self.a, self.ll)
+    }
+}
+
+pub struct Row128<'a> {
+    base: *const u8,
+    lo: u64,
+    hi: u64,
+    a: usize,
+    ll: usize,
+    _m: std::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a> Fields<'a> for Row128<'a> {
+    #[inline(always)]
+    fn next(&mut self) -> &'a [u8] {
+        let b = next_bit(&mut self.lo, &mut self.hi);
+        let f = strip(self.base, self.a, b);
+        self.a = b + 1;
+        f
+    }
+    #[inline(always)]
+    fn last(&mut self) -> &'a [u8] {
+        strip(self.base, self.a, self.ll)
+    }
+}
+
+pub struct RowArr<'a, 'b, const N: usize> {
+    f: &'b [&'a [u8]; N],
+    i: usize,
+}
+
+impl<'a, 'b, const N: usize> Fields<'a> for RowArr<'a, 'b, N> {
+    #[inline(always)]
+    fn next(&mut self) -> &'a [u8] {
+        let v = self.f[self.i];
+        self.i += 1;
+        v
+    }
+    #[inline(always)]
+    fn last(&mut self) -> &'a [u8] {
+        self.f[N - 1]
+    }
+}
+
+/// Calls sink.row for every well-formed N-field line whose first byte lies in
+/// [s, e). The file's first line (the header) is skipped. Fields are produced
+/// lazily from SIMD masks of a 64- or 128-byte window; longer lines go
+/// through split.
+#[inline(always)]
+pub fn rows<'a, const N: usize, S: RowSink<'a>>(data: &'a [u8], s: usize, e: usize, sink: &mut S) {
     let len = data.len();
     let mut pos = if s == 0 {
         match memchr::memchr(b'\n', data) {
@@ -667,44 +910,33 @@ pub fn for_rows<'a, const N: usize>(data: &'a [u8], s: usize, e: usize, mut f: i
             None => return,
         }
     };
-    let mut out: [&'a [u8]; N] = [b""; N];
     while pos < e {
         if pos + 128 <= len {
-            let (nl, cm, qt) = unsafe { masks128(data.as_ptr().add(pos)) };
-            if nl != 0 {
-                let ll = nl.trailing_zeros() as usize;
-                let lm = below(ll);
-                let c = cm & lm;
-                let q = qt & lm;
-                if c.count_ones() as usize == N - 1 && ll > 0 {
-                    let ok = q == 0 || quotes_ok(q, c, ll);
-                    if ok {
-                        let line = &data[pos..pos + ll + 1];
-                        let mut lo = c as u64;
-                        let mut hi = (c >> 64) as u64;
-                        let mut a = 0usize;
-                        for (i, slot) in out.iter_mut().enumerate() {
-                            let b = if i + 1 < N {
-                                if lo != 0 {
-                                    let t = lo.trailing_zeros() as usize;
-                                    lo &= lo - 1;
-                                    t
-                                } else {
-                                    let t = 64 + hi.trailing_zeros() as usize;
-                                    hi &= hi.wrapping_sub(1);
-                                    t
-                                }
-                            } else {
-                                ll
-                            };
-                            // valid quoting is already established: a quoted field
-                            // starts and ends with a quote (and has length >= 2)
-                            let isq = (unsafe { *line.get_unchecked(a) } == b'"') as usize;
-                            *slot = unsafe { line.get_unchecked(a + isq..b - isq) };
-                            a = b + 1;
-                        }
-                        f(&out);
-                    }
+            let base = unsafe { data.as_ptr().add(pos) };
+            let (n0, c0, q0) = unsafe { masks64(base) };
+            if n0 != 0 {
+                // the line fits in the first 64 bytes
+                let ll = n0.trailing_zeros() as usize;
+                let lb = n0 & n0.wrapping_neg();
+                let lm = lb.wrapping_sub(1);
+                let c = c0 & lm;
+                let q = q0 & lm;
+                if c.count_ones() as usize == N - 1 && ll > 0 && (q == 0 || quotes_ok64(q, c, lb)) {
+                    sink.row(&mut Row64 { base, c, a: 0, ll, _m: std::marker::PhantomData });
+                }
+                pos += ll + 1;
+                continue;
+            }
+            let (n1, c1, q1) = unsafe { masks64(base.add(64)) };
+            if n1 != 0 {
+                let ll = 64 + n1.trailing_zeros() as usize;
+                let nl = (n1 as u128) << 64;
+                let lb = nl & nl.wrapping_neg();
+                let lm = lb.wrapping_sub(1);
+                let c = (c0 as u128 | (c1 as u128) << 64) & lm;
+                let q = (q0 as u128 | (q1 as u128) << 64) & lm;
+                if c.count_ones() as usize == N - 1 && (q == 0 || quotes_ok(q, c, lb)) {
+                    sink.row(&mut Row128 { base, lo: c as u64, hi: (c >> 64) as u64, a: 0, ll, _m: std::marker::PhantomData });
                 }
                 pos += ll + 1;
                 continue;
@@ -714,11 +946,32 @@ pub fn for_rows<'a, const N: usize>(data: &'a [u8], s: usize, e: usize, mut f: i
             Some(i) => pos + i,
             None => len,
         };
+        let mut out: [&'a [u8]; N] = [b""; N];
         if split(&data[pos..end], &mut out) {
-            f(&out);
+            sink.row(&mut RowArr { f: &out, i: 0 });
         }
         pos = end + 1;
     }
+}
+
+struct ArrSink<F, const N: usize>(F);
+
+impl<'a, F: FnMut(&[&'a [u8]; N]), const N: usize> RowSink<'a> for ArrSink<F, N> {
+    #[inline(always)]
+    fn row<R: Fields<'a>>(&mut self, r: &mut R) {
+        let mut out: [&'a [u8]; N] = [b""; N];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = if i + 1 < N { r.next() } else { r.last() };
+        }
+        (self.0)(&out);
+    }
+}
+
+/// Calls f with the N fields of every well-formed line whose first byte lies
+/// in [s, e). The file's first line (the header) is skipped.
+#[inline(always)]
+pub fn for_rows<'a, const N: usize>(data: &'a [u8], s: usize, e: usize, f: impl FnMut(&[&'a [u8]; N])) {
+    rows::<N, _>(data, s, e, &mut ArrSink::<_, N>(f));
 }
 
 // ---------------------------------------------------------------------------
@@ -749,13 +1002,104 @@ fn parse8(w: u64) -> u64 {
     (v.wrapping_mul(10000)).wrapping_add(v >> 32) & 0xFFFF_FFFF
 }
 
-/// Like parse_ts, but may read up to 16 bytes from the field start when that
+/// ISO forms "YYYY-MM-DDTHH:MM:SSZ" (20) and "...SS+HH:MM" (25) with one
+/// 32-byte load; same results as parse_ts. Needs 32 readable bytes at f.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn iso_ts_avx2(f: &[u8]) -> Option<i64> {
+    use std::arch::x86_64::*;
+    const fn bits(v: &[u32]) -> u32 {
+        let mut m = 0;
+        let mut i = 0;
+        while i < v.len() {
+            m |= 1 << v[i];
+            i += 1;
+        }
+        m
+    }
+    const D20: u32 = bits(&[0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]);
+    const D25X: u32 = bits(&[20, 21, 23, 24]);
+    const S_ALL: u32 = bits(&[4, 7, 10, 13, 16]);
+    const S20X: u32 = bits(&[19]);
+    const S25X: u32 = bits(&[22]);
+    // range-check bits (2 per u16 lane) of the offset lanes 10 and 11
+    const OFFB: u32 = 0xF << 20;
+    let n = f.len();
+    let p = f.as_ptr();
+    unsafe {
+        let v = _mm256_loadu_si256(p as *const __m256i);
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let isdig = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let tmpl = _mm256_setr_epi8(
+            0, 0, 0, 0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, //
+            b':' as i8, 0, 0, b'Z' as i8, 0, 0, b':' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let issep = _mm256_cmpeq_epi8(v, tmpl);
+        let dm = _mm256_movemask_epi8(isdig) as u32;
+        let sm = _mm256_movemask_epi8(issep) as u32;
+        let l25 = n == 25;
+        let dmask = D20 | if l25 { D25X } else { 0 };
+        let smask = S_ALL | if l25 { S25X } else { S20X };
+        // digits into aligned pairs: lane 0 Y Y Y Y M M D D h h m m, lane 1 s s _ _ oh oh om om
+        let idx = _mm256_setr_epi8(
+            0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1, //
+            1, 2, -1, -1, 4, 5, 7, 8, -1, -1, -1, -1, -1, -1, -1, -1,
+        );
+        let sh = _mm256_shuffle_epi8(d, idx);
+        // u16: [YY, YY, M, D, h, m, 0, 0 | s, 0, oh, om, 0, 0, 0, 0]
+        let m = _mm256_maddubs_epi16(sh, _mm256_set1_epi16(0x010A));
+        let hi = _mm256_setr_epi16(99, 99, 12, 31, 23, 59, 0, 0, 59, 0, 23, 59, 0, 0, 0, 0);
+        let lo = _mm256_setr_epi16(0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let bad = _mm256_or_si256(_mm256_cmpgt_epi16(m, hi), _mm256_cmpgt_epi16(lo, m));
+        let bm = _mm256_movemask_epi8(bad) as u32 & if l25 { !0 } else { !OFFB };
+        if (dm & dmask) != dmask || (sm & smask) != smask || bm != 0 {
+            return None;
+        }
+        // i32: [year, M, h*3600+m*60, 0 | s, oh*3600+om*60, 0, 0]
+        let w = _mm256_setr_epi16(100, 1, 1, 0, 3600, 60, 0, 0, 1, 0, 3600, 60, 0, 0, 0, 0);
+        let r = _mm256_madd_epi16(m, w);
+        let rl = _mm256_castsi256_si128(r);
+        let rh = _mm256_extracti128_si256(r, 1);
+        let y = _mm_cvtsi128_si32(rl) as i64;
+        let mo = _mm_extract_epi32(rl, 1) as i64;
+        let hm = _mm_extract_epi32(rl, 2) as i64;
+        let sec = _mm_cvtsi128_si32(rh) as i64;
+        let off = _mm_extract_epi32(rh, 1) as i64;
+        let dd = _mm256_extract_epi16(m, 3) as i64;
+        if !(TY0..TY0 + TNY as i64).contains(&y) {
+            return parse_ts(f);
+        }
+        let i = ((y - TY0) * 12 + mo - 1) as usize;
+        let ms = *MONTH_START.get_unchecked(i) as i64;
+        if dd > *MONTH_START.get_unchecked(i + 1) as i64 - ms {
+            return None;
+        }
+        let mut t = (ms + dd - 1) * 86_400 + hm + sec;
+        if l25 {
+            let sg = *p.add(19);
+            if sg == b'+' {
+                t -= off;
+            } else if sg == b'-' {
+                t += off;
+            } else {
+                return None;
+            }
+        }
+        Some(t * 1000)
+    }
+}
+
+/// Like parse_ts, but may read up to 32 bytes from the field start when that
 /// stays below `end`.
 #[inline(always)]
 pub fn parse_ts_fast(f: &[u8], end: *const u8) -> Option<i64> {
     let n = f.len();
     let p = f.as_ptr();
     if n == 20 || n == 25 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if p.wrapping_add(32) <= end {
+            return unsafe { iso_ts_avx2(f) };
+        }
         // "YYYY-MM-" "DDTHH:MM" ":SS" + Z | +HH:MM
         let w0 = ld8(p);
         let w1 = ld8(unsafe { p.add(8) });
@@ -778,18 +1122,23 @@ pub fn parse_ts_fast(f: &[u8], end: *const u8) -> Option<i64> {
         if !ok {
             return None;
         }
-        // xor, not subtract: separator bytes would borrow into their neighbours
-        let d0 = w0 ^ (0x30 * ONES);
-        let d1 = w1 ^ (0x30 * ONES);
-        let d2 = w2 ^ (0x30 * ONES);
+        // digit values with separators zeroed, then byte k := 10*d[k] + d[k+1]
+        // (no carries: every byte is <= 9 before, <= 99 after)
+        let p0 = (w0 ^ (0x30 * ONES)) & M0D;
+        let p1 = (w1 ^ (0x30 * ONES)) & M1D;
+        let p2 = (w2 ^ (0x30 * ONES)) & M2D;
+        let t0 = p0.wrapping_mul(10).wrapping_add(p0 >> 8);
+        let t1 = p1.wrapping_mul(10).wrapping_add(p1 >> 8);
+        let t2 = p2.wrapping_mul(10).wrapping_add(p2 >> 8);
         let b = |w: u64, i: u32| ((w >> (8 * i)) & 0xFF) as i64;
-        let y = b(d0, 0) * 1000 + b(d0, 1) * 100 + b(d0, 2) * 10 + b(d0, 3);
-        let mo = b(d0, 5) * 10 + b(d0, 6);
-        let d = b(d1, 0) * 10 + b(d1, 1);
-        let h = b(d1, 3) * 10 + b(d1, 4);
-        let mi = b(d1, 6) * 10 + b(d1, 7);
-        let s = b(d2, 6) * 10 + b(d2, 7);
-        if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || s > 59 {
+        let y = b(t0, 0) * 100 + b(t0, 2);
+        let mo = b(t0, 5);
+        let d = b(t1, 0);
+        let h = b(t1, 3);
+        let mi = b(t1, 6);
+        let s = b(t2, 6);
+        let ok = ((mo as u64).wrapping_sub(1) < 12) & ((d as u64).wrapping_sub(1) < 31) & (h < 24) & (mi < 60) & (s < 60);
+        if !ok {
             return None;
         }
         let days = if (TY0..TY0 + TNY as i64).contains(&y) {
