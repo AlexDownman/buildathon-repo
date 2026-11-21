@@ -488,6 +488,14 @@ mod tests {
             data.extend_from_slice(&[0u8; 256]);
             let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
             for_rows::<3>(&data, 0, len, |f| got.push(f.iter().map(|v| v.to_vec()).collect()));
+            // chunked: lines starting in [s, e) for a split point
+            let mid = 1 + (x as usize) % len.max(2).saturating_sub(1);
+            let mut got4: Vec<Vec<Vec<u8>>> = Vec::new();
+            for_rows::<3>(&data, 0, mid, |f| got4.push(f.iter().map(|v| v.to_vec()).collect()));
+            if mid > 0 {
+                for_rows::<3>(&data, mid, len, |f| got4.push(f.iter().map(|v| v.to_vec()).collect()));
+            }
+            assert_eq!(got4, got);
             let mut want: Vec<Vec<Vec<u8>>> = Vec::new();
             for l in &lines {
                 let mut o: [&[u8]; 3] = [b""; 3];
