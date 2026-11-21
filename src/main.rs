@@ -31,6 +31,14 @@ static P_BITS: AtomicU32 = AtomicU32::new(10); // person buckets
 const CHUNK: usize = 4 << 20;
 const PAD: usize = 256;
 const PIECE: usize = 256 << 10;
+/// records staged per bucket before a write-combined flush (32-byte records)
+const SK: usize = 8;
+
+/// tunables (env overrides are for probe experiments only)
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+static PIECE_SZ: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| env_usize("PIECE_KB", PIECE >> 10) << 10);
 
 const K_INVALID: u8 = 0;
 const K_VIEW: u8 = 1;
@@ -384,74 +392,33 @@ fn main() {
         EV_BITS.store(10, AO::Relaxed);
         P_BITS.store(11, AO::Relaxed);
     }
+    if let Some(b) = std::env::var("EVBITS").ok().and_then(|s| s.parse().ok()) {
+        EV_BITS.store(b, AO::Relaxed);
+    }
+    if let Some(b) = std::env::var("PBITS").ok().and_then(|s| s.parse().ok()) {
+        P_BITS.store(b, AO::Relaxed);
+    }
     let nev_b = 1usize << EV_BITS.load(AO::Relaxed);
     let np_b = 1usize << P_BITS.load(AO::Relaxed);
-    let ntask = ev_chunks.len() + cl_chunks.len();
 
-    struct ParseOut {
-        id: usize,
-        evk: Parts<DKey, 8>,
-        evp: Parts<EvOut, 8>,
-        cl: Parts<ClRec, 4>,
-        buf: Vec<u8>,
-    }
-    let next_id = AtomicUsize::new(0);
-    let parsed = par_for(
-        nthreads,
-        ntask,
-        || ParseOut {
-            id: next_id.fetch_add(1, AO::Relaxed),
-            evk: Parts::new(nev_b),
-            evp: Parts::new(np_b),
-            cl: Parts::new(np_b),
-            buf: Vec::new(),
-        },
-        |po, i| {
-            // read in cache-sized pieces so the buffer stays in L2
-            if i < ev_chunks.len() {
-                let (fi, s0, e0) = ev_chunks[i];
-                if *MMAPIO {
-                    parse_events(ev_in.maps[fi].bytes(), s0, e0, &ctx, po.id, &mut po.evk, &mut po.evp);
-                    return;
-                }
-                let mut p = s0;
-                while p < e0 {
-                    let q = (p + PIECE).min(e0);
-                    let (s, e) = ev_in.read(fi, p, q, &mut po.buf);
-                    parse_events(&po.buf, s, e, &ctx, po.id, &mut po.evk, &mut po.evp);
-                    p = q;
-                }
-            } else {
-                let (fi, s0, e0) = cl_chunks[i - ev_chunks.len()];
-                if *MMAPIO {
-                    parse_clicks(cl_in.maps[fi].bytes(), s0, e0, &ctx, &mut po.cl);
-                    return;
-                }
-                let mut p = s0;
-                while p < e0 {
-                    let q = (p + PIECE).min(e0);
-                    let (s, e) = cl_in.read(fi, p, q, &mut po.buf);
-                    parse_clicks(&po.buf, s, e, &ctx, &mut po.cl);
-                    p = q;
-                }
-            }
-        },
-    );
+    let parsed: Vec<Parsed> = if std::env::var_os("STAGE4").is_some() {
+        run_parse::<4>(nthreads, &ev_in, &cl_in, &ev_chunks, &cl_chunks, &ctx, nev_b, np_b)
+    } else {
+        run_parse::<SK>(nthreads, &ev_in, &cl_in, &ev_chunks, &cl_chunks, &ctx, nev_b, np_b)
+    };
     // dedup keys go bucket-major (each dedup task takes its bucket and hands
     // the blocks back); payloads stay per worker until dedup has marked losers
     let ev_b: Vec<Mutex<Vec<BlockVec<DKey>>>> = (0..nev_b).map(|_| Mutex::new(Vec::new())).collect();
     let cl_b: Vec<Mutex<Vec<BlockVec<ClRec>>>> = (0..np_b).map(|_| Mutex::new(Vec::new())).collect();
-    let mut parsed = parsed;
-    parsed.sort_by_key(|p| p.id);
     let mut pay: Vec<Vec<BlockVec<EvOut>>> = Vec::with_capacity(parsed.len());
     let (mut nrec, mut ncl) = (0usize, 0usize);
     for p in parsed {
-        for (b, v) in p.evk.finish().into_iter().enumerate() {
+        for (b, v) in p.evk.into_iter().enumerate() {
             nrec += v.len();
             ev_b[b].lock().unwrap().push(v);
         }
-        pay.push(p.evp.finish());
-        for (b, v) in p.cl.finish().into_iter().enumerate() {
+        pay.push(p.evp);
+        for (b, v) in p.cl.into_iter().enumerate() {
             ncl += v.len();
             cl_b[b].lock().unwrap().push(v);
         }
@@ -659,6 +626,79 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
 }
 
 /// lists: per worker, (pairs, keys per shard)
+/// One parse worker's finished output, ordered by worker id.
+struct Parsed {
+    evk: Vec<BlockVec<DKey>>,
+    evp: Vec<BlockVec<EvOut>>,
+    cl: Vec<BlockVec<ClRec>>,
+}
+
+/// Parses all event and click chunks on nthreads workers. K = records staged
+/// per bucket before each write-combined flush.
+#[allow(clippy::too_many_arguments)]
+fn run_parse<const K: usize>(
+    nthreads: usize,
+    ev_in: &Input,
+    cl_in: &Input,
+    ev_chunks: &[(usize, usize, usize)],
+    cl_chunks: &[(usize, usize, usize)],
+    ctx: &Ctx,
+    nev_b: usize,
+    np_b: usize,
+) -> Vec<Parsed> {
+    struct ParseOut<const K: usize> {
+        id: usize,
+        evk: Parts<DKey, K>,
+        evp: Parts<EvOut, K>,
+        cl: Parts<ClRec, 4>,
+        buf: Vec<u8>,
+    }
+    let next_id = AtomicUsize::new(0);
+    let mut outs = par_for(
+        nthreads,
+        ev_chunks.len() + cl_chunks.len(),
+        || ParseOut::<K> {
+            id: next_id.fetch_add(1, AO::Relaxed),
+            evk: Parts::new(nev_b),
+            evp: Parts::new(np_b),
+            cl: Parts::new(np_b),
+            buf: Vec::new(),
+        },
+        |po, i| {
+            // read in cache-sized pieces so the buffer stays in L2
+            if i < ev_chunks.len() {
+                let (fi, s0, e0) = ev_chunks[i];
+                if *MMAPIO {
+                    parse_events(ev_in.maps[fi].bytes(), s0, e0, ctx, po.id, &mut po.evk, &mut po.evp);
+                    return;
+                }
+                let mut p = s0;
+                while p < e0 {
+                    let q = (p + *PIECE_SZ).min(e0);
+                    let (s, e) = ev_in.read(fi, p, q, &mut po.buf);
+                    parse_events(&po.buf, s, e, ctx, po.id, &mut po.evk, &mut po.evp);
+                    p = q;
+                }
+            } else {
+                let (fi, s0, e0) = cl_chunks[i - ev_chunks.len()];
+                if *MMAPIO {
+                    parse_clicks(cl_in.maps[fi].bytes(), s0, e0, ctx, &mut po.cl);
+                    return;
+                }
+                let mut p = s0;
+                while p < e0 {
+                    let q = (p + *PIECE_SZ).min(e0);
+                    let (s, e) = cl_in.read(fi, p, q, &mut po.buf);
+                    parse_clicks(&po.buf, s, e, ctx, &mut po.cl);
+                    p = q;
+                }
+            }
+        },
+    );
+    outs.sort_by_key(|p| p.id);
+    outs.into_iter().map(|p| Parsed { evk: p.evk.finish(), evp: p.evp.finish(), cl: p.cl.finish() }).collect()
+}
+
 /// Diagnostics only (used by probe.sh, never by a real run):
 /// PROBE_OUT=file appends a one-line phase summary of this run to file;
 /// PROBE_NOTES=file adds its lines as extra campaign_daily rows.
@@ -943,11 +983,11 @@ struct PendEv {
     kind: u8,
 }
 
-fn parse_events(d: &[u8], s: usize, e: usize, ctx: &Ctx, wid: usize, outk: &mut Parts<DKey, 8>, outp: &mut Parts<EvOut, 8>) {
+fn parse_events<const K: usize>(d: &[u8], s: usize, e: usize, ctx: &Ctx, wid: usize, outk: &mut Parts<DKey, K>, outp: &mut Parts<EvOut, K>) {
     let end = d.as_ptr_range().end;
     let mut ring = [PendEv::default(); RING];
     let mut cnt = 0usize;
-    let finish = |p: &PendEv, outk: &mut Parts<DKey, 8>, outp: &mut Parts<EvOut, 8>| {
+    let finish = |p: &PendEv, outk: &mut Parts<DKey, K>, outp: &mut Parts<EvOut, K>| {
         let (pkey, ph) = match ctx.link.get_h(p.ukey, p.hu) {
             Some(n) => (n, p_hash(n)),
             None => (p.ukey, p.hu),
