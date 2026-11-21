@@ -9,14 +9,13 @@
 //!  5. write Parquet
 
 mod alloc;
-mod output;
 mod part;
+mod pq;
 mod util;
 
 #[global_allocator]
 static GLOBAL: alloc::BigAlloc = alloc::BigAlloc;
 
-use parquet::data_type::ByteArray;
 use part::Parts;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -29,6 +28,7 @@ const EV_BITS: u32 = 9; // dedup buckets
 const P_BITS: u32 = 10; // person buckets
 const CHUNK: usize = 8 << 20;
 const PAD: usize = 256;
+const PIECE: usize = 256 << 10;
 
 const K_INVALID: u8 = 0;
 const K_VIEW: u8 = 1;
@@ -179,7 +179,7 @@ impl Input {
     fn read(&self, fi: usize, s: usize, e: usize, buf: &mut Vec<u8>) -> (usize, usize) {
         let (f, flen) = (&self.files[fi].0, self.files[fi].1);
         let off = s.saturating_sub(1);
-        let mut extra = 64 << 10;
+        let mut extra = 4 << 10;
         loop {
             let end = (e + extra).min(flen);
             let n = end - off;
@@ -349,14 +349,25 @@ fn main() {
             buf: Vec::new(),
         },
         |po, i| {
+            // read in cache-sized pieces so the buffer stays in L2
             if i < ev_chunks.len() {
-                let (fi, s, e) = ev_chunks[i];
-                let (s, e) = ev_in.read(fi, s, e, &mut po.buf);
-                parse_events(&po.buf, s, e, &ctx, &mut po.evk, &mut po.evp);
+                let (fi, s0, e0) = ev_chunks[i];
+                let mut p = s0;
+                while p < e0 {
+                    let q = (p + PIECE).min(e0);
+                    let (s, e) = ev_in.read(fi, p, q, &mut po.buf);
+                    parse_events(&po.buf, s, e, &ctx, &mut po.evk, &mut po.evp);
+                    p = q;
+                }
             } else {
-                let (fi, s, e) = cl_chunks[i - ev_chunks.len()];
-                let (s, e) = cl_in.read(fi, s, e, &mut po.buf);
-                parse_clicks(&po.buf, s, e, &ctx, &mut po.cl);
+                let (fi, s0, e0) = cl_chunks[i - ev_chunks.len()];
+                let mut p = s0;
+                while p < e0 {
+                    let q = (p + PIECE).min(e0);
+                    let (s, e) = cl_in.read(fi, p, q, &mut po.buf);
+                    parse_clicks(&po.buf, s, e, &ctx, &mut po.cl);
+                    p = q;
+                }
             }
         },
     );
@@ -385,8 +396,9 @@ fn main() {
     .into_iter()
     .map(|(p, _, _)| p.finish())
     .collect();
-    drop(evk_parts);
-    drop(evp_parts);
+    // freeing is left to process exit (cheaper than munmap + TLB shootdowns now)
+    std::mem::forget(evk_parts);
+    std::mem::forget(evp_parts);
     let nsurv: usize = deduped.iter().flatten().map(|v| v.len()).sum();
     log(t0, &format!("dedup: {} surviving events", nsurv));
 
@@ -395,8 +407,6 @@ fn main() {
         rows: Vec<URow>,
         camp: Vec<[i64; 4]>,
         sc: Scratch,
-        evs: Vec<EvOut>,
-        cls: Vec<ClRec>,
     }
     let ncamp_tot = ctx.ncamp() + 1;
     let pouts = par_for(
@@ -406,23 +416,15 @@ fn main() {
             rows: Vec::new(),
             camp: vec![[0i64; 4]; ncamp_tot * ndays],
             sc: Scratch::new(ctx.cat_names.len()),
-            evs: Vec::new(),
-            cls: Vec::new(),
         },
         |po, b| {
-            po.evs.clear();
-            for d in &deduped {
-                po.evs.extend_from_slice(&d[b]);
-            }
-            po.cls.clear();
-            for d in &cl_parts {
-                po.cls.extend_from_slice(&d[b]);
-            }
-            process_bucket(&po.evs, &po.cls, &ctx, &mut po.sc, &mut po.rows, &mut po.camp);
+            let evs: Vec<&[EvOut]> = deduped.iter().map(|d| &d[b][..]).collect();
+            let cls: Vec<&[ClRec]> = cl_parts.iter().map(|d| &d[b][..]).collect();
+            process_bucket(&evs, &cls, &ctx, &mut po.sc, &mut po.rows, &mut po.camp);
         },
     );
-    drop(deduped);
-    drop(cl_parts);
+    std::mem::forget(deduped);
+    std::mem::forget(cl_parts);
     let nrows: usize = pouts.iter().map(|p| p.rows.len()).sum();
     log(t0, &format!("sessions done: {} user_daily rows", nrows));
 
@@ -440,28 +442,30 @@ fn main() {
             }
         }
     }
-    let mut cc = output::CampCols {
-        campaign_id: vec![],
-        channel: vec![],
-        day: vec![],
-        sessions: vec![],
-        purchasing: vec![],
-        revenue: vec![],
-        assisted: vec![],
-    };
+    let mut cc: Vec<pq::Column> = vec![
+        pq::Column::new("campaign_id", pq::Kind::Str, 0),
+        pq::Column::new("channel", pq::Kind::Str, 0),
+        pq::Column::new("day", pq::Kind::Date, 0),
+        pq::Column::new("sessions", pq::Kind::I64, 0),
+        pq::Column::new("purchasing_sessions", pq::Kind::I64, 0),
+        pq::Column::new("revenue_cents", pq::Kind::I64, 0),
+        pq::Column::new("assisted_sessions", pq::Kind::I64, 0),
+    ];
+    let mut ncrows = 0usize;
     for c in 0..ncamp_tot {
         for d in 0..ndays {
             let s = camp[c * ndays + d];
             if s[0] > 0 || s[3] > 0 {
                 let (id, ch): (&[u8], &[u8]) =
                     if c == ctx.ncamp() { (b"organic", b"organic") } else { (&ctx.camp_ids[c], &ctx.channels[c]) };
-                cc.campaign_id.push(ByteArray::from(id.to_vec()));
-                cc.channel.push(ByteArray::from(ch.to_vec()));
-                cc.day.push((day0 + d as i64) as i32);
-                cc.sessions.push(s[0]);
-                cc.purchasing.push(s[1]);
-                cc.revenue.push(s[2]);
-                cc.assisted.push(s[3]);
+                cc[0].push_str(id);
+                cc[1].push_str(ch);
+                cc[2].push_i32((day0 + d as i64) as i32);
+                cc[3].push_i64(s[0]);
+                cc[4].push_i64(s[1]);
+                cc[5].push_i64(s[2]);
+                cc[6].push_i64(s[3]);
+                ncrows += 1;
             }
         }
     }
@@ -470,39 +474,38 @@ fn main() {
     std::thread::scope(|s| {
         let cdp = &cd;
         let ccr = &cc;
-        s.spawn(move || output::write_campaign_daily(&cdp.join("part-0.parquet"), ccr).unwrap());
+        s.spawn(move || pq::write(&cdp.join("part-0.parquet"), ncrows, ccr).expect("write campaign_daily"));
         for (i, rows) in rows_parts.iter().enumerate() {
             let udp = &ud;
             let ctx = &ctx;
             s.spawn(move || {
-                let cat_bytes: Vec<ByteArray> = ctx.cat_names.iter().map(|c| ByteArray::from(c.clone())).collect();
-                let mut c = output::UserCols {
-                    user_id: Vec::with_capacity(rows.len()),
-                    day: Vec::with_capacity(rows.len()),
-                    sessions: Vec::with_capacity(rows.len()),
-                    events: Vec::with_capacity(rows.len()),
-                    revenue: Vec::with_capacity(rows.len()),
-                    top: Vec::new(),
-                    top_def: Vec::with_capacity(rows.len()),
-                };
+                let n = rows.len();
+                let mut c = vec![
+                    pq::Column::new("user_id", pq::Kind::Str, n),
+                    pq::Column::new("day", pq::Kind::Date, n),
+                    pq::Column::new("sessions", pq::Kind::I64, n),
+                    pq::Column::new("events", pq::Kind::I64, n),
+                    pq::Column::new("revenue_cents", pq::Kind::I64, n),
+                    pq::Column::new("top_category", pq::Kind::OptStr, n),
+                ];
                 for r in rows {
-                    c.user_id.push(ByteArray::from(key_bytes(r.pkey)));
-                    c.day.push(r.day);
-                    c.sessions.push(r.sessions);
-                    c.events.push(r.events);
-                    c.revenue.push(r.revenue);
-                    if r.top == u16::MAX {
-                        c.top_def.push(0);
+                    if is_long(r.pkey) {
+                        c[0].push_str(&key_bytes(r.pkey));
                     } else {
-                        c.top_def.push(1);
-                        c.top.push(cat_bytes[r.top as usize].clone());
+                        let a = r.pkey.to_be_bytes();
+                        c[0].push_str(&a[..a[15] as usize]);
                     }
+                    c[1].push_i32(r.day);
+                    c[2].push_i64(r.sessions);
+                    c[3].push_i64(r.events);
+                    c[4].push_i64(r.revenue);
+                    c[5].push_opt_str(if r.top == u16::MAX { None } else { Some(&ctx.cat_names[r.top as usize]) });
                 }
-                output::write_user_daily(&udp.join(format!("part-{}.parquet", i)), &c).unwrap();
+                pq::write(&udp.join(format!("part-{}.parquet", i)), n, &c).expect("write user_daily");
             });
         }
     });
-    log(t0, &format!("wrote {} user_daily rows, {} campaign_daily rows", nrows, cc.day.len()));
+    log(t0, &format!("wrote {} user_daily rows, {} campaign_daily rows", nrows, ncrows));
 }
 
 const L_BITS: u32 = 6;
@@ -886,6 +889,40 @@ struct Scratch {
     coff: Vec<u32>,
     evs: Vec<EvOut>,
     cls: Vec<ClRec>,
+    skeys: Vec<u64>,
+    skeys2: Vec<u64>,
+    tmp: Vec<EvOut>,
+}
+
+/// LSD radix sort of u64 keys by their top 31 bits (3 passes of 11 bits).
+fn radix_sort_hi31(a: &mut Vec<u64>, b: &mut Vec<u64>) {
+    let n = a.len();
+    b.clear();
+    b.resize(n, 0);
+    let mut cnt = [[0u32; 2048]; 3];
+    for &k in a.iter() {
+        cnt[0][((k >> 33) & 2047) as usize] += 1;
+        cnt[1][((k >> 44) & 2047) as usize] += 1;
+        cnt[2][((k >> 55) & 2047) as usize] += 1;
+    }
+    for c in cnt.iter_mut() {
+        let mut s = 0u32;
+        for x in c.iter_mut() {
+            let v = *x;
+            *x = s;
+            s += v;
+        }
+    }
+    for (pass, sh) in [33u32, 44, 55].into_iter().enumerate() {
+        let (src, dst) = if pass % 2 == 0 { (&*a, &mut *b) } else { (&*b, &mut *a) };
+        let c = &mut cnt[pass];
+        for &k in src.iter() {
+            let d = ((k >> sh) & 2047) as usize;
+            dst[c[d] as usize] = k;
+            c[d] += 1;
+        }
+    }
+    std::mem::swap(a, b); // 3 passes: result is in b
 }
 
 impl Scratch {
@@ -904,14 +941,26 @@ impl Scratch {
             coff: vec![],
             evs: vec![],
             cls: vec![],
+            skeys: vec![],
+            skeys2: vec![],
+            tmp: vec![],
         }
     }
 }
 
 /// Groups the bucket's events and clicks by person (hash + counting sort),
 /// sorts each person's rows by time, and processes them.
-fn process_bucket(evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scratch, rows: &mut Vec<URow>, camp: &mut [[i64; 4]]) {
-    let n = evs.len();
+fn process_bucket(
+    evsrc: &[&[EvOut]],
+    clsrc: &[&[ClRec]],
+    ctx: &Ctx,
+    sc: &mut Scratch,
+    rows: &mut Vec<URow>,
+    camp: &mut [[i64; 4]],
+) {
+    let evs = || evsrc.iter().flat_map(|s| s.iter());
+    let cls = || clsrc.iter().flat_map(|s| s.iter());
+    let n: usize = evsrc.iter().map(|s| s.len()).sum();
     if n == 0 {
         return;
     }
@@ -923,7 +972,7 @@ fn process_bucket(evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scratch, row
         sc.table.resize(cap, (0, 0));
         sc.pkeys.clear();
         sc.pid.clear();
-        for e in evs {
+        for e in evs() {
             let k = e.pkey;
             let mut i = (hash128(k) as usize) & mask;
             let id = loop {
@@ -962,7 +1011,7 @@ fn process_bucket(evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scratch, row
     sc.evs.resize(n, EvOut::default());
     {
         let mut pos: Vec<u32> = sc.eoff[..np].to_vec();
-        for (e, &id) in evs.iter().zip(sc.pid.iter()) {
+        for (e, &id) in evs().zip(sc.pid.iter()) {
             let p = &mut pos[id as usize];
             sc.evs[*p as usize] = *e;
             *p += 1;
@@ -970,7 +1019,7 @@ fn process_bucket(evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scratch, row
     }
     // clicks of persons that have events
     sc.pid.clear();
-    for c in cls {
+    for c in cls() {
         let k = c.pkey;
         let mut i = (hash128(k) as usize) & mask;
         let id = loop {
@@ -1000,7 +1049,7 @@ fn process_bucket(evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scratch, row
     sc.cls.resize(nc, ClRec::default());
     {
         let mut pos: Vec<u32> = sc.coff[..np].to_vec();
-        for (c, &id) in cls.iter().zip(sc.pid.iter()) {
+        for (c, &id) in cls().zip(sc.pid.iter()) {
             if id != u32::MAX {
                 let p = &mut pos[id as usize];
                 sc.cls[*p as usize] = *c;
@@ -1015,7 +1064,20 @@ fn process_bucket(evs: &[EvOut], cls: &[ClRec], ctx: &Ctx, sc: &mut Scratch, row
         let (ea, eb) = (sc.eoff[id] as usize, sc.eoff[id + 1] as usize);
         let (ca, cb) = (sc.coff[id] as usize, sc.coff[id + 1] as usize);
         let pe = &mut evs_s[ea..eb];
-        if pe.len() > 1 {
+        if pe.len() > 24 {
+            // sort compact u64 keys (time offset, index), then permute
+            let ws = ctx.ws;
+            sc.skeys.clear();
+            sc.skeys.extend(pe.iter().enumerate().map(|(i, e)| (((e.ts - ws) as u64) << 33) | i as u64));
+            if pe.len() > 2048 {
+                radix_sort_hi31(&mut sc.skeys, &mut sc.skeys2);
+            } else {
+                sc.skeys.sort_unstable();
+            }
+            sc.tmp.clear();
+            sc.tmp.extend(sc.skeys.iter().map(|&k| pe[(k & ((1 << 33) - 1)) as usize]));
+            pe.copy_from_slice(&sc.tmp);
+        } else if pe.len() > 1 {
             pe.sort_unstable_by_key(|e| e.ts);
         }
         let pc = &mut cls_s[ca..cb];

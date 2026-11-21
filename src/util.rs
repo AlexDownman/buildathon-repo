@@ -200,10 +200,6 @@ impl<V: Copy + Default> KeyMap<V> {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
     pub fn slots_mut(&mut self) -> &mut [(u128, V)] {
         &mut self.slots
     }
